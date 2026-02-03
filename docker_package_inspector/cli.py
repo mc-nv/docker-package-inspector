@@ -186,6 +186,143 @@ def _write_csv(output_data, filename):
         _write_csv_to_file(output_data, f)
 
 
+def _compute_package_diff(result1, result2):
+    """Compute the difference between two package lists.
+
+    Args:
+        result1: First image result with 'packages' list
+        result2: Second image result with 'packages' list
+
+    Returns:
+        dict: Structured diff with 'added', 'removed', and 'changed' lists
+    """
+    # Create dictionaries keyed by package name for easy lookup
+    packages1 = {pkg["name"]: pkg for pkg in result1.get("packages", [])}
+    packages2 = {pkg["name"]: pkg for pkg in result2.get("packages", [])}
+
+    # Find packages only in image 2 (added)
+    added = []
+    for name, pkg in packages2.items():
+        if name not in packages1:
+            added.append(
+                {
+                    "name": pkg["name"],
+                    "version": pkg["version"],
+                    "package_type": pkg["package_type"],
+                    "license": pkg.get("license", "Unknown"),
+                    "source": pkg.get("source", ""),
+                }
+            )
+
+    # Find packages only in image 1 (removed)
+    removed = []
+    for name, pkg in packages1.items():
+        if name not in packages2:
+            removed.append(
+                {
+                    "name": pkg["name"],
+                    "version": pkg["version"],
+                    "package_type": pkg["package_type"],
+                    "license": pkg.get("license", "Unknown"),
+                    "source": pkg.get("source", ""),
+                }
+            )
+
+    # Find packages in both but with different versions (changed)
+    changed = []
+    for name in packages1:
+        if name in packages2:
+            pkg1 = packages1[name]
+            pkg2 = packages2[name]
+            if pkg1["version"] != pkg2["version"]:
+                changed.append(
+                    {
+                        "name": name,
+                        "version_from": pkg1["version"],
+                        "version_to": pkg2["version"],
+                        "package_type": pkg1["package_type"],
+                        "license_from": pkg1.get("license", "Unknown"),
+                        "license_to": pkg2.get("license", "Unknown"),
+                    }
+                )
+
+    # Sort all lists by name
+    added.sort(key=lambda x: x["name"])
+    removed.sort(key=lambda x: x["name"])
+    changed.sort(key=lambda x: x["name"])
+
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+    }
+
+
+def _write_diff_csv_to_file(diff_data, file_handle):
+    """Write diff data to CSV file handle."""
+    fieldnames = [
+        "change_type",
+        "name",
+        "version_from",
+        "version_to",
+        "package_type",
+        "license_from",
+        "license_to",
+        "source",
+    ]
+
+    writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+    writer.writeheader()
+
+    # Write added packages
+    for pkg in diff_data["added"]:
+        row = {
+            "change_type": "ADDED",
+            "name": _sanitize_csv_value(pkg["name"]),
+            "version_from": "",
+            "version_to": _sanitize_csv_value(pkg["version"]),
+            "package_type": _sanitize_csv_value(pkg["package_type"]),
+            "license_from": "",
+            "license_to": _truncate_license(pkg.get("license", "Unknown")),
+            "source": _sanitize_csv_value(pkg.get("source", "")),
+        }
+        writer.writerow(row)
+
+    # Write removed packages
+    for pkg in diff_data["removed"]:
+        row = {
+            "change_type": "REMOVED",
+            "name": _sanitize_csv_value(pkg["name"]),
+            "version_from": _sanitize_csv_value(pkg["version"]),
+            "version_to": "",
+            "package_type": _sanitize_csv_value(pkg["package_type"]),
+            "license_from": _truncate_license(pkg.get("license", "Unknown")),
+            "license_to": "",
+            "source": _sanitize_csv_value(pkg.get("source", "")),
+        }
+        writer.writerow(row)
+
+    # Write changed packages
+    for pkg in diff_data["changed"]:
+        row = {
+            "change_type": "CHANGED",
+            "name": _sanitize_csv_value(pkg["name"]),
+            "version_from": _sanitize_csv_value(pkg["version_from"]),
+            "version_to": _sanitize_csv_value(pkg["version_to"]),
+            "package_type": _sanitize_csv_value(pkg["package_type"]),
+            "license_from": _truncate_license(pkg.get("license_from", "Unknown")),
+            "license_to": _truncate_license(pkg.get("license_to", "Unknown")),
+            "source": "",
+        }
+        writer.writerow(row)
+
+
+def _write_diff_csv(diff_data, filename):
+    """Write diff data to CSV file."""
+    with open(filename, "w", encoding="utf-8", newline="") as f:
+        _write_diff_csv_to_file(diff_data, f)
+
+
 def main():
     """Main entry point for the CLI."""
     # Register signal handlers for graceful shutdown
@@ -220,6 +357,10 @@ Examples:
 
   # Output formats
   docker-package-inspector --image python:3.11/amd64 --output packages.json --csv-output packages.csv
+
+  # Diff mode - compare two images
+  docker-package-inspector --diff --image python:3.11 --image python:3.12
+  docker-package-inspector --diff --image ubuntu:22.04/amd64 --image ubuntu:24.04/amd64 --output diff.json
         """,
     )
 
@@ -292,6 +433,12 @@ Examples:
         "--verbose", "-v", action="store_true", help="Enable verbose output"
     )
 
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="Compare packages between exactly two images and show differences (added, removed, changed)",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -319,6 +466,15 @@ Examples:
             global_architectures.extend(
                 [arch.strip() for arch in args.architectures.split(",")]
             )
+
+        # Validate --diff requirements
+        if args.diff:
+            if len(image_specs) != 2:
+                parser.error("--diff requires exactly 2 images to compare")
+            if global_architectures:
+                parser.error(
+                    "--diff cannot be used with multiple architectures. Use inline architecture syntax (e.g., image:tag/arch) for each image"
+                )
 
         inspector = DockerImageInspector(verbose=args.verbose)
         results = []
@@ -372,21 +528,53 @@ Examples:
                 raise
 
         # Create output data
-        # Calculate unique images and architectures
-        unique_images = len(set(img for img, _ in image_specs))
-        unique_archs = len(
-            set(arch for _, arch in inspection_tasks if arch is not None)
-        )
-        if unique_archs == 0:
-            unique_archs = 1  # At least one (host default)
+        if args.diff:
+            # Diff mode - compare the two images
+            diff_result = _compute_package_diff(results[0], results[1])
 
-        output_data = {
-            "version": __version__,
-            "inspection_date": datetime.now(timezone.utc).isoformat(),
-            "total_images": unique_images,
-            "total_architectures": unique_archs,
-            "results": results,
-        }
+            output_data = {
+                "version": __version__,
+                "inspection_date": datetime.now(timezone.utc).isoformat(),
+                "comparison_type": "diff",
+                "image_from": {
+                    "name": results[0]["image"],
+                    "digest": results[0]["digest"],
+                    "architecture": results[0]["architecture"],
+                    "total_packages": len(results[0]["packages"]),
+                },
+                "image_to": {
+                    "name": results[1]["image"],
+                    "digest": results[1]["digest"],
+                    "architecture": results[1]["architecture"],
+                    "total_packages": len(results[1]["packages"]),
+                },
+                "summary": {
+                    "added": len(diff_result["added"]),
+                    "removed": len(diff_result["removed"]),
+                    "changed": len(diff_result["changed"]),
+                    "unchanged": len(results[0]["packages"])
+                    - len(diff_result["removed"])
+                    - len(diff_result["changed"]),
+                },
+                "differences": diff_result,
+            }
+        else:
+            # Normal mode - list all packages
+            # Calculate unique images and architectures
+            unique_images = len(set(img for img, _ in image_specs))
+            unique_archs = len(
+                set(arch for _, arch in inspection_tasks if arch is not None)
+            )
+            if unique_archs == 0:
+                unique_archs = 1  # At least one (host default)
+
+            output_data = {
+                "version": __version__,
+                "inspection_date": datetime.now(timezone.utc).isoformat(),
+                "total_images": unique_images,
+                "total_architectures": unique_archs,
+                "results": results,
+            }
 
         # Generate output based on specified options
         json_written = False
@@ -403,7 +591,10 @@ Examples:
 
         # Write CSV output
         if args.csv_output:
-            _write_csv(output_data, args.csv_output)
+            if args.diff:
+                _write_diff_csv(output_data["differences"], args.csv_output)
+            else:
+                _write_csv(output_data, args.csv_output)
             if args.verbose:
                 print(f"CSV output written to: {args.csv_output}", file=sys.stderr)
             csv_written = True
@@ -417,7 +608,10 @@ Examples:
                 import io
 
                 output = io.StringIO()
-                _write_csv_to_file(output_data, output)
+                if args.diff:
+                    _write_diff_csv_to_file(output_data["differences"], output)
+                else:
+                    _write_csv_to_file(output_data, output)
                 print(output.getvalue(), end="")
 
         return 0
