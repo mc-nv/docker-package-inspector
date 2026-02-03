@@ -58,24 +58,42 @@ class PackageMetadataFetcher:
 
                 # Extract license
                 license_info = info.get("license")
+                licenses = []
+
                 if license_info:
-                    # Parse the license text to identify the actual license type
+                    # Parse the license text to identify the actual license type(s)
                     detected_license = self._detect_license_from_content(license_info)
                     if detected_license:
-                        metadata["license"] = detected_license
+                        # detected_license may already contain multiple licenses joined by " | "
+                        licenses.extend(detected_license.split(" | "))
                         metadata["license_source"] = "PyPI API (license field, parsed)"
                     else:
-                        # If detection fails, use the raw license text
-                        metadata["license"] = license_info
-                        metadata["license_source"] = "PyPI API (license field)"
+                        # If detection fails, parse the license field for multiple licenses
+                        parsed_licenses = self._parse_license_field_from_pypi(
+                            license_info
+                        )
+                        if parsed_licenses:
+                            licenses.extend(parsed_licenses)
+                            metadata["license_source"] = "PyPI API (license field)"
+                        else:
+                            # Use the raw license text
+                            licenses.append(license_info)
+                            metadata["license_source"] = "PyPI API (license field)"
+
+                # Also check classifiers for additional licenses
+                classifiers = info.get("classifiers", [])
+                for classifier in classifiers:
+                    if classifier.startswith("License ::"):
+                        classifier_license = classifier.split("::")[-1].strip()
+                        if classifier_license not in licenses:
+                            licenses.append(classifier_license)
+                            if not license_info:
+                                metadata["license_source"] = "PyPI API (classifier)"
+
+                if licenses:
+                    metadata["license"] = " | ".join(licenses)
                 else:
-                    # Try classifiers
-                    classifiers = info.get("classifiers", [])
-                    for classifier in classifiers:
-                        if classifier.startswith("License ::"):
-                            metadata["license"] = classifier.split("::")[-1].strip()
-                            metadata["license_source"] = "PyPI API (classifier)"
-                            break
+                    metadata["license"] = "Unknown"
 
                 # Extract source code URL
                 project_urls = info.get("project_urls", {})
@@ -282,6 +300,67 @@ class PackageMetadataFetcher:
             pass
         return None
 
+    def _parse_license_field_from_pypi(self, license_text: str) -> list:
+        """Parse a license field from PyPI that may contain multiple licenses.
+
+        Handles formats like:
+        - "MIT or Apache-2.0"
+        - "GPL-2.0+"
+        - "Apache-2.0 and BSD-3-Clause"
+        - "NVIDIA Proprietary"
+
+        Args:
+            license_text: License field text from PyPI
+
+        Returns:
+            List of license identifiers
+        """
+        if not license_text:
+            return []
+
+        licenses = []
+
+        # Check for corporate/proprietary licenses
+        proprietary_indicators = [
+            r"\bproprietary\b",
+            r"\bcommercial\b",
+            r"\bcorporate\b",
+            r"\bcustom\b",
+        ]
+
+        lower_text = license_text.lower()
+        is_proprietary = any(
+            re.search(pattern, lower_text) for pattern in proprietary_indicators
+        )
+
+        if is_proprietary:
+            # Keep the original text as the license name
+            clean_license = re.sub(r"\s+", " ", license_text.strip())
+            if len(clean_license) > 100:
+                clean_license = clean_license[:100].strip() + "..."
+            licenses.append(clean_license)
+            return licenses
+
+        # Try to split on common separators
+        # Split on " or ", " and ", " / " while preserving the parts
+        parts = re.split(r"\s+(?:or|and|/)\s+", license_text, flags=re.IGNORECASE)
+
+        for part in parts:
+            part = part.strip()
+            if part:
+                # Try to detect standard license from this part
+                detected = self._detect_license_from_content(part)
+                if detected:
+                    for lic in detected.split(" | "):
+                        if lic not in licenses:
+                            licenses.append(lic)
+                else:
+                    # Keep the original part if not detected
+                    if part not in licenses:
+                        licenses.append(part)
+
+        return licenses
+
     def _detect_license_from_content(self, content: str) -> Optional[str]:
         """Detect license type from license file content.
 
@@ -289,7 +368,7 @@ class PackageMetadataFetcher:
             content: License file content
 
         Returns:
-            License identifier or None
+            License identifier or list of identifiers separated by " | ", or None
         """
         if not content:
             return None
@@ -297,20 +376,34 @@ class PackageMetadataFetcher:
         content_lower = content.lower()
 
         # License detection patterns (ordered by specificity)
+        # Note: Patterns are checked in order, but all matches are collected
         license_patterns = [
+            # Apache patterns
             (r"apache license\s*,?\s*version 2\.0", "Apache-2.0"),
             (r"apache license version 2", "Apache-2.0"),
             (r"apache-2\.0", "Apache-2.0"),
+            (r"\bapache\s+2\.0\b", "Apache-2.0"),
+            (r"\bapache2\b", "Apache-2.0"),
+            # GPL patterns
             (r"gnu general public license.*version 3", "GPL-3.0"),
             (r"gnu general public license.*version 2", "GPL-2.0"),
-            (r"gpl-3", "GPL-3.0"),
-            (r"gpl-2", "GPL-2.0"),
+            (r"gpl-3\.0", "GPL-3.0"),
+            (r"gpl-2\.0", "GPL-2.0"),
+            (r"\bgpl\s+3\b", "GPL-3.0"),
+            (r"\bgpl\s+2\b", "GPL-2.0"),
+            (r"\bgplv3\b", "GPL-3.0"),
+            (r"\bgplv2\b", "GPL-2.0"),
+            # LGPL patterns
             (r"gnu lesser general public license.*version 3", "LGPL-3.0"),
             (r"gnu lesser general public license.*version 2", "LGPL-2.0"),
-            (r"lgpl-3", "LGPL-3.0"),
-            (r"lgpl-2", "LGPL-2.0"),
+            (r"lgpl-3\.0", "LGPL-3.0"),
+            (r"lgpl-2\.0", "LGPL-2.0"),
+            (r"\blgpl\s+3\b", "LGPL-3.0"),
+            (r"\blgpl\s+2\b", "LGPL-2.0"),
+            # MIT patterns
             (r"mit license", "MIT"),
             (r"permission is hereby granted, free of charge", "MIT"),
+            (r"\bmit\b(?!\s*(?:license|$))", "MIT"),  # Match standalone "MIT"
             # BSD-3-Clause patterns (ordered by specificity)
             (r"bsd[- ]3[- ]clause", "BSD-3-Clause"),
             (r"3[- ]clause bsd", "BSD-3-Clause"),
@@ -331,13 +424,23 @@ class PackageMetadataFetcher:
             (r"2[- ]clause bsd", "BSD-2-Clause"),
             # Generic BSD (if no specific clause count found)
             (r"redistribution and use in source and binary forms", "BSD"),
+            (r"\bbsd\b(?!\s*(?:license|$))", "BSD"),  # Match standalone "BSD"
+            # Mozilla patterns
             (r"mozilla public license.*version 2\.0", "MPL-2.0"),
             (r"mpl-2\.0", "MPL-2.0"),
+            (r"\bmpl\s+2\b", "MPL-2.0"),
+            # ISC patterns
             (r"isc license", "ISC"),
+            (r"\bisc\b(?!\s*(?:license|$))", "ISC"),  # Match standalone "ISC"
         ]
 
+        detected_licenses = []
         for pattern, license_id in license_patterns:
             if re.search(pattern, content_lower):
-                return license_id
+                if license_id not in detected_licenses:
+                    detected_licenses.append(license_id)
+
+        if detected_licenses:
+            return " | ".join(detected_licenses)
 
         return None

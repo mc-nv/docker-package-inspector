@@ -371,38 +371,196 @@ class DockerImageInspector:
             content: Copyright file content
 
         Returns:
-            License string or "Unknown"
+            License string (may contain multiple licenses separated by " | ") or "Unknown"
         """
         if not content:
             return "Unknown"
 
-        # Use the metadata fetcher's sophisticated license detection
-        # This will parse the content and identify specific licenses
-        detected_license = self.metadata_fetcher._detect_license_from_content(content)
-        if detected_license:
-            return detected_license
+        licenses = []
 
-        # If content-based detection fails, look for explicit License: field
+        # First, look for explicit License: field
         lines = content.split("\n")
+        explicit_licenses = []
+
         for line in lines:
             line_stripped = line.strip()
 
             # Match "License: <name>" pattern
             if line_stripped.startswith("License:"):
                 license_part = line_stripped.split("License:", 1)[1].strip()
-                # Extract the license name and parse it to identify the actual license
+                # Extract the license name
                 license_text = license_part.split("\n")[0].strip()
                 if license_text:
-                    # Try to detect license from this extracted text
-                    parsed_license = self.metadata_fetcher._detect_license_from_content(
-                        license_text
-                    )
-                    if parsed_license:
-                        return parsed_license
-                    # If detection fails but we have text, return it
-                    return license_text
+                    # Parse multiple licenses from the field
+                    parsed = self._parse_license_field(license_text)
+                    explicit_licenses.extend(parsed)
+
+        # Use the metadata fetcher's sophisticated license detection on full content
+        detected_license = self.metadata_fetcher._detect_license_from_content(content)
+
+        # Combine explicit and detected licenses
+        if explicit_licenses:
+            licenses.extend(explicit_licenses)
+        if detected_license:
+            # detected_license may already be multiple licenses joined by " | "
+            for lic in detected_license.split(" | "):
+                if lic not in licenses:
+                    licenses.append(lic)
+
+        # Also check if content contains proprietary indicators, even if standard licenses were found
+        # This handles cases like "Apache-2.0. Some components under proprietary license"
+        import re
+
+        proprietary_indicators = [
+            r"\bproprietary\b",
+            r"\bcommercial\b",
+            r"\bcorporate\b",
+        ]
+        lower_content = content.lower()
+        has_proprietary = any(
+            re.search(pattern, lower_content) for pattern in proprietary_indicators
+        )
+
+        if has_proprietary:
+            # Try to extract just the proprietary part
+            # Look for sentences or phrases containing proprietary indicators
+            sentences = re.split(r"[.!]\s+", content)
+            for sentence in sentences:
+                sentence_lower = sentence.lower()
+                if any(
+                    re.search(pattern, sentence_lower)
+                    for pattern in proprietary_indicators
+                ):
+                    # This sentence contains proprietary info
+                    # Parse it to extract the license
+                    parsed = self._parse_license_field(sentence)
+                    for lic in parsed:
+                        # Check if this looks like a proprietary license (not a standard one)
+                        # and not already in licenses
+                        if lic not in licenses and any(
+                            re.search(pattern, lic.lower())
+                            for pattern in proprietary_indicators
+                        ):
+                            licenses.append(lic)
+
+        # If no licenses found yet, try to parse the entire content as a license field
+        # This handles cases like proprietary licenses that don't match standard patterns
+        if not licenses:
+            parsed = self._parse_license_field(content)
+            if parsed:
+                licenses.extend(parsed)
+
+        if licenses:
+            return " | ".join(licenses)
 
         return "Unknown"
+
+    def _parse_license_field(self, license_text):
+        """Parse a license field that may contain multiple licenses.
+
+        Handles formats like:
+        - "MIT or Apache-2.0"
+        - "GPL-2.0+"
+        - "Apache-2.0 and BSD-3-Clause"
+        - "NVIDIA Proprietary"
+        - "Custom Corporate License"
+
+        Args:
+            license_text: License field text
+
+        Returns:
+            List of license identifiers
+        """
+        if not license_text:
+            return []
+
+        licenses = []
+        import re
+
+        # Check for corporate/proprietary licenses first
+        # These often contain terms like "Proprietary", "Commercial", company names, etc.
+        proprietary_indicators = [
+            r"\bproprietary\b",
+            r"\bcommercial\b",
+            r"\bcorporate\b",
+            r"\bnvidia\b",
+            r"\bcustom\b",
+            r"\binternal\b",
+        ]
+
+        lower_text = license_text.lower()
+        is_proprietary = any(
+            re.search(pattern, lower_text) for pattern in proprietary_indicators
+        )
+
+        # Try to detect standard licenses in the text
+        detected = self.metadata_fetcher._detect_license_from_content(license_text)
+        if detected:
+            # detected may be multiple licenses joined by " | "
+            licenses.extend(detected.split(" | "))
+
+        if is_proprietary:
+            # Extract the proprietary license name
+            # Try to find the license name (often before a period or newline)
+            clean_license = re.sub(r"\s+", " ", license_text.strip())
+
+            # Look for common patterns:
+            # "NVIDIA Proprietary License"
+            # "Proprietary and confidential"
+            # "Commercial License"
+
+            # Try to extract just the license statement (first line or sentence)
+            lines = clean_license.split("\n")
+            first_line = lines[0].strip()
+
+            # If first line is short and contains proprietary indicator, use it
+            if len(first_line) < 100 and any(
+                re.search(pattern, first_line.lower())
+                for pattern in proprietary_indicators
+            ):
+                proprietary_license = first_line
+            else:
+                # Try to extract first sentence
+                parts = clean_license.split(".", 1)
+                if (
+                    parts[0]
+                    and len(parts[0]) < 100
+                    and any(
+                        re.search(pattern, parts[0].lower())
+                        for pattern in proprietary_indicators
+                    )
+                ):
+                    proprietary_license = parts[0].strip()
+                else:
+                    # Fall back to first 100 chars
+                    proprietary_license = clean_license[:100].strip()
+                    if len(clean_license) > 100:
+                        proprietary_license += "..."
+
+            # Add if not already in licenses
+            if proprietary_license not in licenses:
+                licenses.append(proprietary_license)
+
+        elif not licenses:
+            # No standard license detected and not obviously proprietary
+            # Return the text as-is (but sanitized and truncated)
+            clean_license = re.sub(r"\s+", " ", license_text.strip())
+
+            # Try to extract just the license name
+            # Check if it looks like a full license text (contains multiple sentences)
+            if "." in clean_license and len(clean_license) > 200:
+                # Likely full license text, try to extract name from first sentence
+                first_sentence = clean_license.split(".")[0].strip()
+                if len(first_sentence) < 100:
+                    clean_license = first_sentence
+                else:
+                    clean_license = clean_license[:100].strip() + "..."
+            elif len(clean_license) > 100:
+                clean_license = clean_license[:100].strip() + "..."
+
+            licenses.append(clean_license)
+
+        return licenses
 
     def _enrich_unknown_licenses(self, packages, container):
         """Try to find licenses for packages with unknown licenses.
@@ -471,19 +629,11 @@ class DockerImageInspector:
                     license_info = line.split("License:", 1)[1].strip()
                     if license_info and license_info not in ["", "UNKNOWN", "Unknown"]:
                         # Parse the license text to identify the actual license type
-                        # instead of returning raw copyright/license text
-                        detected_license = (
-                            self.metadata_fetcher._detect_license_from_content(
-                                license_info
-                            )
-                        )
-                        if detected_license:
-                            return detected_license, "pip show metadata (parsed)"
-                        # If it's just a copyright notice without license text,
-                        # don't return it - fall through to read LICENSE files
-                        if not license_info.lower().startswith("copyright"):
-                            # If detection fails but we have non-copyright license text, return it
-                            return license_info, "pip show metadata"
+                        # Parse multiple licenses if present
+                        parsed_licenses = self._parse_license_field(license_info)
+                        if parsed_licenses:
+                            license_str = " | ".join(parsed_licenses)
+                            return license_str, "pip show metadata (parsed)"
                         # Otherwise fall through to read LICENSE files
 
             # Try to find and read LICENSE files from package
