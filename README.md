@@ -10,6 +10,8 @@ A CLI tool to inspect Docker images and extract detailed package information inc
 - Query PyPI for Python package metadata
 - Output results as structured JSON
 - Support for multi-architecture images
+- **Multiple license detection** - Automatically detects and parses packages with dual or multi-licensing (e.g., "MIT or Apache-2.0")
+- **Corporate/proprietary license support** - Properly identifies and preserves corporate and proprietary license names
 
 ## Installation
 
@@ -215,6 +217,16 @@ Find packages with specific license:
 jq '.packages[] | select(.license | contains("MIT")) | .name' triton_packages.json
 ```
 
+Find packages with multiple licenses:
+
+```bash
+# Find dual-licensed packages
+jq '.packages[] | select(.license | contains("|")) | {name, license}' triton_packages.json
+
+# Find packages with proprietary licenses
+jq '.packages[] | select(.license | test("Proprietary|Commercial")) | {name, license}' triton_packages.json
+```
+
 Get image digest and architecture:
 
 ```bash
@@ -363,11 +375,21 @@ When inspecting multiple images or architectures, the structure changes to:
 - `name`: Package name
 - `version`: Package version
 - `source`: PyPI URL for Python packages, repository for binary packages
-- `license`: Package license
+- `license`: Package license. For packages with multiple licenses, they are separated by ` | ` (e.g., "MIT | Apache-2.0"). Corporate and proprietary licenses are preserved with their full names (e.g., "NVIDIA Proprietary License").
 - `source_code_url`: URL to source code repository
 - `package_type`: Either "python" or "binary"
 - `is_dependency`: Boolean indicating if this package is a dependency of another package
 - `parent_packages`: Array of package names that depend on this package
+
+### License Parsing
+
+The tool automatically detects and handles multiple licenses:
+
+- **Dual/Multi-licensing**: Packages licensed under multiple licenses (e.g., "MIT or Apache-2.0") are parsed and stored as "MIT | Apache-2.0"
+- **Corporate/Proprietary**: Corporate and proprietary licenses (e.g., "NVIDIA Proprietary", "Commercial License") are detected and preserved with their original names
+- **Mixed licensing**: Packages with both standard and proprietary components are properly identified (e.g., "Apache-2.0 | NVIDIA Proprietary License")
+
+For more details, see [MULTIPLE_LICENSES.md](MULTIPLE_LICENSES.md)
 
 ## Requirements
 
