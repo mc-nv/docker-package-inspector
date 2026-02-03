@@ -1,6 +1,7 @@
 """Docker image inspection logic."""
 
 import json
+import signal
 import sys
 
 import docker
@@ -83,6 +84,7 @@ class DockerImageInspector:
 
         # Create and run container
         self._log("Creating temporary container...")
+        container = None
         try:
             container = client.containers.create(
                 image_name, command="sleep infinity", detach=True
@@ -92,56 +94,63 @@ class DockerImageInspector:
             container.start()
             self._log("Container started")
 
-            try:
-                python_packages = self._extract_python_packages(container)
-                binary_packages = self._extract_binary_packages(container)
+            python_packages = self._extract_python_packages(container)
+            binary_packages = self._extract_binary_packages(container)
 
-                # Get Python package dependencies
-                python_deps = self._get_python_dependencies(container)
+            # Get Python package dependencies
+            python_deps = self._get_python_dependencies(container)
 
-                # Mark packages with dependency information
-                all_packages = []
+            # Mark packages with dependency information
+            all_packages = []
 
-                # Process Python packages
-                for pkg in python_packages:
-                    pkg["package_type"] = "python"
-                    pkg["is_dependency"] = False
-                    pkg["parent_packages"] = []
-                    all_packages.append(pkg)
+            # Process Python packages
+            for pkg in python_packages:
+                pkg["package_type"] = "python"
+                pkg["is_dependency"] = False
+                pkg["parent_packages"] = []
+                all_packages.append(pkg)
 
-                # Process binary packages
-                for pkg in binary_packages:
-                    pkg["package_type"] = "binary"
-                    pkg["is_dependency"] = False
-                    pkg["parent_packages"] = []
-                    all_packages.append(pkg)
+            # Process binary packages
+            for pkg in binary_packages:
+                pkg["package_type"] = "binary"
+                pkg["is_dependency"] = False
+                pkg["parent_packages"] = []
+                all_packages.append(pkg)
 
-                # Mark Python dependencies
-                for pkg_name, deps in python_deps.items():
-                    for dep in deps:
-                        for pkg in all_packages:
-                            if (
-                                pkg["name"].lower() == dep.lower()
-                                and pkg["package_type"] == "python"
-                            ):
-                                pkg["is_dependency"] = True
-                                if pkg_name not in pkg["parent_packages"]:
-                                    pkg["parent_packages"].append(pkg_name)
+            # Mark Python dependencies
+            for pkg_name, deps in python_deps.items():
+                for dep in deps:
+                    for pkg in all_packages:
+                        if (
+                            pkg["name"].lower() == dep.lower()
+                            and pkg["package_type"] == "python"
+                        ):
+                            pkg["is_dependency"] = True
+                            if pkg_name not in pkg["parent_packages"]:
+                                pkg["parent_packages"].append(pkg_name)
 
-                # Post-process: Check source URLs for packages with unknown licenses
-                self._enrich_unknown_licenses(all_packages, container)
+            # Post-process: Check source URLs for packages with unknown licenses
+            self._enrich_unknown_licenses(all_packages, container)
 
-                return {
-                    "digest": image_digest,
-                    "architecture": image_arch,
-                    "packages": all_packages,
-                }
-            finally:
-                container.remove(force=True)
-                self._log("Temporary container removed")
+            return {
+                "digest": image_digest,
+                "architecture": image_arch,
+                "packages": all_packages,
+            }
 
+        except KeyboardInterrupt:
+            self._log("Interrupted by user, cleaning up container...")
+            raise
         except Exception as e:
             raise Exception(f"Failed to inspect container: {e}")
+        finally:
+            # Ensure container is always removed, even on interrupt
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                    self._log("Temporary container removed")
+                except Exception as cleanup_error:
+                    self._log(f"Warning: Failed to remove container: {cleanup_error}")
 
     def _extract_python_packages(self, container):
         """Extract Python packages from container.
