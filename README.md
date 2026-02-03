@@ -88,6 +88,19 @@ Export to both JSON and CSV simultaneously:
 docker-package-inspector --image python:3.11-slim --output packages.json --csv-output packages.csv
 ```
 
+Customize the separator for parent_packages field in CSV output:
+
+```bash
+# Use comma separator
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator ","
+
+# Use pipe separator
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator "|"
+
+# Use custom string
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator " / "
+```
+
 ### Inline Architecture Specification
 
 You can specify the architecture directly in the image name using the format `<registry><path>:<tag>/<arch>`:
@@ -206,7 +219,7 @@ CSV format is ideal for importing into spreadsheets, databases, or data analysis
 - `license` - Package license
 - `source_code_url` - Source code repository URL
 - `is_dependency` - True/False
-- `parent_packages` - Semicolon-separated list of parent packages
+- `parent_packages` - Semicolon-separated list of parent packages (separator can be customized with `--separator`)
 
 ### Analyzing the Output
 
