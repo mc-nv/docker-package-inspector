@@ -6,6 +6,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
+from . import __version__
 from .inspector import DockerImageInspector
 
 
@@ -210,6 +211,12 @@ Examples:
   # Output formats
   docker-package-inspector --image python:3.11/amd64 --output packages.json --csv-output packages.csv
         """,
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     parser.add_argument(

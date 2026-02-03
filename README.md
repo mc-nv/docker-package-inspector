@@ -13,6 +13,27 @@ A CLI tool to inspect Docker images and extract detailed package information inc
 
 ## Installation
 
+### From GitHub
+
+Install directly from the repository:
+
+```bash
+pip install git+https://github.com/mc-nv/docker-package-inspector.git
+```
+
+Or install a specific branch, tag, or commit:
+
+```bash
+# Install from a specific branch
+pip install git+https://github.com/mc-nv/docker-package-inspector.git@branch-name
+
+# Install from a specific tag
+pip install git+https://github.com/mc-nv/docker-package-inspector.git@v1.0.0
+
+# Install from a specific commit
+pip install git+https://github.com/mc-nv/docker-package-inspector.git@abc1234
+```
+
 ### From source
 
 ```bash
