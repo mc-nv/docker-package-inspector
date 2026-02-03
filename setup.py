@@ -7,7 +7,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="docker-package-inspector",
-    version="0.3.1",
+    version="0.3.2",
     author="Your Name",
     author_email="your.email@example.com",
     description="A CLI tool to inspect Docker images and extract package information",
