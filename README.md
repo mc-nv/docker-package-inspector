@@ -169,6 +169,32 @@ This will inspect all combinations:
 - python:3.12 on amd64
 - python:3.12 on arm64
 
+### Diff Mode - Compare Two Images
+
+Compare packages between exactly two images to see what has been added, removed, or changed:
+
+```bash
+# Basic diff
+docker-package-inspector --diff --image python:3.11 --image python:3.12
+
+# Diff with specific architectures
+docker-package-inspector --diff --image ubuntu:22.04/amd64 --image ubuntu:24.04/amd64
+
+# Save diff to files
+docker-package-inspector --diff \
+  --image python:3.11 \
+  --image python:3.12 \
+  --output diff.json \
+  --csv-output diff.csv
+```
+
+Diff mode outputs a structured comparison showing:
+- **Added packages**: Packages that exist only in the second image
+- **Removed packages**: Packages that exist only in the first image
+- **Changed packages**: Packages that exist in both images but with different versions
+
+The JSON output includes a summary with counts and detailed lists of changes. The CSV output formats the diff as a table with columns for change type, package name, old/new versions, and licenses.
+
 CSV format is ideal for importing into spreadsheets, databases, or data analysis tools. The CSV includes all package information in a flat table format with columns:
 - `image` - Docker image name
 - `digest` - Image digest (SHA256)
@@ -258,7 +284,16 @@ jq -r '.packages[] | [.name, .version, .package_type, .license] | @csv' triton_p
 **Compare packages between two images:**
 
 ```bash
-# Generate reports for two images
+# Using diff mode (recommended)
+docker-package-inspector --diff --image python:3.10 --image python:3.11
+
+# With output files
+docker-package-inspector --diff --image python:3.10 --image python:3.11 --output diff.json --csv-output diff.csv
+
+# Compare specific architectures
+docker-package-inspector --diff --image python:3.10/amd64 --image python:3.11/amd64
+
+# Alternative: Generate separate reports and manually compare
 docker-package-inspector --image python:3.10 --output python310.json
 docker-package-inspector --image python:3.11 --output python311.json
 
@@ -298,6 +333,76 @@ for dep in deps:
 ```
 
 ## Output Format
+
+### Diff Mode Output
+
+When using `--diff`, the JSON output structure is:
+
+```json
+{
+  "version": "1.0.0",
+  "inspection_date": "2024-01-15T10:30:00+00:00",
+  "comparison_type": "diff",
+  "image_from": {
+    "name": "python:3.11",
+    "digest": "python@sha256:abc123...",
+    "architecture": "amd64",
+    "total_packages": 150
+  },
+  "image_to": {
+    "name": "python:3.12",
+    "digest": "python@sha256:def456...",
+    "architecture": "amd64",
+    "total_packages": 160
+  },
+  "summary": {
+    "added": 15,
+    "removed": 5,
+    "changed": 8,
+    "unchanged": 137
+  },
+  "differences": {
+    "added": [
+      {
+        "name": "new-package",
+        "version": "1.0.0",
+        "package_type": "python",
+        "license": "MIT",
+        "source": "https://pypi.org/project/new-package/"
+      }
+    ],
+    "removed": [
+      {
+        "name": "old-package",
+        "version": "0.5.0",
+        "package_type": "python",
+        "license": "Apache 2.0",
+        "source": "https://pypi.org/project/old-package/"
+      }
+    ],
+    "changed": [
+      {
+        "name": "updated-package",
+        "version_from": "2.0.0",
+        "version_to": "2.1.0",
+        "package_type": "python",
+        "license_from": "MIT",
+        "license_to": "MIT"
+      }
+    ]
+  }
+}
+```
+
+The CSV output for diff mode has these columns:
+- `change_type` - "ADDED", "REMOVED", or "CHANGED"
+- `name` - Package name
+- `version_from` - Version in the first image (empty for ADDED)
+- `version_to` - Version in the second image (empty for REMOVED)
+- `package_type` - "python" or "binary"
+- `license_from` - License in the first image (empty for ADDED)
+- `license_to` - License in the second image (empty for REMOVED)
+- `source` - Package source URL
 
 ### Single Image Output
 
