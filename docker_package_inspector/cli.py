@@ -284,6 +284,9 @@ Examples:
 
     args = parser.parse_args()
 
+    if args.verbose:
+        print(f"docker-package-inspector version {__version__}", file=sys.stderr)
+
     try:
         # Parse image list with inline architectures
         image_specs = []  # List of (image_name, arch) tuples
@@ -360,6 +363,7 @@ Examples:
             unique_archs = 1  # At least one (host default)
 
         output_data = {
+            "version": __version__,
             "inspection_date": datetime.now(timezone.utc).isoformat(),
             "total_images": unique_images,
             "total_architectures": unique_archs,
