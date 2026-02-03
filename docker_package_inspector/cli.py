@@ -3,11 +3,17 @@
 import argparse
 import csv
 import json
+import signal
 import sys
 from datetime import datetime, timezone
 
 from . import __version__
 from .inspector import DockerImageInspector
+
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals gracefully by raising KeyboardInterrupt."""
+    raise KeyboardInterrupt()
 
 
 def _parse_image_with_arch(image_str):
@@ -182,6 +188,10 @@ def _write_csv(output_data, filename):
 
 def main():
     """Main entry point for the CLI."""
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     parser = argparse.ArgumentParser(
         description="Inspect Docker images and extract package information",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -332,26 +342,34 @@ Examples:
         total_combinations = len(inspection_tasks)
 
         for idx, (image_name, arch) in enumerate(inspection_tasks, 1):
-            if args.verbose:
-                print(
-                    f"\n[{idx}/{total_combinations}] Inspecting image: {image_name}",
-                    file=sys.stderr,
+            try:
+                if args.verbose:
+                    print(
+                        f"\n[{idx}/{total_combinations}] Inspecting image: {image_name}",
+                        file=sys.stderr,
+                    )
+                    if arch:
+                        print(f"Architecture: {arch}", file=sys.stderr)
+
+                result = inspector.inspect_image(
+                    image_name=image_name, architecture=arch, pull=args.pull
                 )
-                if arch:
-                    print(f"Architecture: {arch}", file=sys.stderr)
 
-            result = inspector.inspect_image(
-                image_name=image_name, architecture=arch, pull=args.pull
-            )
-
-            results.append(
-                {
-                    "image": image_name,
-                    "digest": result.get("digest", ""),
-                    "architecture": result.get("architecture", "unknown"),
-                    "packages": result.get("packages", []),
-                }
-            )
+                results.append(
+                    {
+                        "image": image_name,
+                        "digest": result.get("digest", ""),
+                        "architecture": result.get("architecture", "unknown"),
+                        "packages": result.get("packages", []),
+                    }
+                )
+            except KeyboardInterrupt:
+                if args.verbose:
+                    print(
+                        f"\nInterrupted while processing image {idx}/{total_combinations}",
+                        file=sys.stderr,
+                    )
+                raise
 
         # Create output data
         # Calculate unique images and architectures
@@ -404,6 +422,9 @@ Examples:
 
         return 0
 
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user. Exiting...", file=sys.stderr)
+        return 130  # Standard exit code for SIGINT
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         if args.verbose:
