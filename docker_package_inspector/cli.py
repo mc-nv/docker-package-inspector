@@ -204,29 +204,19 @@ def _compute_package_diff(result1, result2):
     added = []
     for name, pkg in packages2.items():
         if name not in packages1:
-            added.append(
-                {
-                    "name": pkg["name"],
-                    "version": pkg["version"],
-                    "package_type": pkg["package_type"],
-                    "license": pkg.get("license", "Unknown"),
-                    "source": pkg.get("source", ""),
-                }
-            )
+            # Preserve all package fields and add change_type
+            pkg_copy = pkg.copy()
+            pkg_copy["change_type"] = "ADDED"
+            added.append(pkg_copy)
 
     # Find packages only in image 1 (removed)
     removed = []
     for name, pkg in packages1.items():
         if name not in packages2:
-            removed.append(
-                {
-                    "name": pkg["name"],
-                    "version": pkg["version"],
-                    "package_type": pkg["package_type"],
-                    "license": pkg.get("license", "Unknown"),
-                    "source": pkg.get("source", ""),
-                }
-            )
+            # Preserve all package fields and add change_type
+            pkg_copy = pkg.copy()
+            pkg_copy["change_type"] = "REMOVED"
+            removed.append(pkg_copy)
 
     # Find packages in both but with different versions (changed)
     changed = []
@@ -235,16 +225,12 @@ def _compute_package_diff(result1, result2):
             pkg1 = packages1[name]
             pkg2 = packages2[name]
             if pkg1["version"] != pkg2["version"]:
-                changed.append(
-                    {
-                        "name": name,
-                        "version_from": pkg1["version"],
-                        "version_to": pkg2["version"],
-                        "package_type": pkg1["package_type"],
-                        "license_from": pkg1.get("license", "Unknown"),
-                        "license_to": pkg2.get("license", "Unknown"),
-                    }
-                )
+                # Use pkg2 as base (new version) and preserve all fields
+                pkg_copy = pkg2.copy()
+                pkg_copy["change_type"] = "CHANGED"
+                # Add version_from for changed packages to show the transition
+                pkg_copy["version_from"] = pkg1["version"]
+                changed.append(pkg_copy)
 
     # Sort all lists by name
     added.sort(key=lambda x: x["name"])
@@ -260,59 +246,52 @@ def _compute_package_diff(result1, result2):
 
 def _write_diff_csv_to_file(diff_data, file_handle):
     """Write diff data to CSV file handle."""
+    # Use same fieldnames as regular output, but add change_type and version_from
     fieldnames = [
         "change_type",
         "name",
+        "version",
         "version_from",
-        "version_to",
         "package_type",
-        "license_from",
-        "license_to",
+        "package_provider",
         "source",
+        "license",
+        "license_source",
+        "source_code_url",
+        "is_dependency",
+        "parent_packages",
     ]
 
-    writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+    writer = csv.DictWriter(file_handle, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
 
-    # Write added packages
-    for pkg in diff_data["added"]:
-        row = {
-            "change_type": "ADDED",
-            "name": _sanitize_csv_value(pkg["name"]),
-            "version_from": "",
-            "version_to": _sanitize_csv_value(pkg["version"]),
-            "package_type": _sanitize_csv_value(pkg["package_type"]),
-            "license_from": "",
-            "license_to": _truncate_license(pkg.get("license", "Unknown")),
-            "source": _sanitize_csv_value(pkg.get("source", "")),
-        }
-        writer.writerow(row)
+    # Write all packages (added, removed, changed) with preserved fields
+    all_packages = []
+    all_packages.extend(diff_data["added"])
+    all_packages.extend(diff_data["removed"])
+    all_packages.extend(diff_data["changed"])
 
-    # Write removed packages
-    for pkg in diff_data["removed"]:
-        row = {
-            "change_type": "REMOVED",
-            "name": _sanitize_csv_value(pkg["name"]),
-            "version_from": _sanitize_csv_value(pkg["version"]),
-            "version_to": "",
-            "package_type": _sanitize_csv_value(pkg["package_type"]),
-            "license_from": _truncate_license(pkg.get("license", "Unknown")),
-            "license_to": "",
-            "source": _sanitize_csv_value(pkg.get("source", "")),
-        }
-        writer.writerow(row)
+    # Sort by change_type (ADDED, CHANGED, REMOVED) and then by name
+    all_packages.sort(key=lambda x: (x["change_type"], x["name"]))
 
-    # Write changed packages
-    for pkg in diff_data["changed"]:
+    for pkg in all_packages:
         row = {
-            "change_type": "CHANGED",
+            "change_type": pkg["change_type"],
             "name": _sanitize_csv_value(pkg["name"]),
-            "version_from": _sanitize_csv_value(pkg["version_from"]),
-            "version_to": _sanitize_csv_value(pkg["version_to"]),
+            "version": _sanitize_csv_value(pkg["version"]),
+            "version_from": _sanitize_csv_value(pkg.get("version_from", "")),
             "package_type": _sanitize_csv_value(pkg["package_type"]),
-            "license_from": _truncate_license(pkg.get("license_from", "Unknown")),
-            "license_to": _truncate_license(pkg.get("license_to", "Unknown")),
-            "source": "",
+            "package_provider": _sanitize_csv_value(
+                pkg.get("package_provider", "Unknown")
+            ),
+            "source": _sanitize_csv_value(pkg.get("source", "")),
+            "license": _truncate_license(pkg.get("license", "Unknown")),
+            "license_source": _sanitize_csv_value(pkg.get("license_source", "Unknown")),
+            "source_code_url": _sanitize_csv_value(pkg.get("source_code_url", "")),
+            "is_dependency": pkg.get("is_dependency", False),
+            "parent_packages": _sanitize_csv_value(
+                "; ".join(pkg.get("parent_packages", []))
+            ),
         }
         writer.writerow(row)
 
