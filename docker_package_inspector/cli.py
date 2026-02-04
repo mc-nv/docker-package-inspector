@@ -221,12 +221,16 @@ def _write_csv(output_data, filename, delimiter=","):
         _write_csv_to_file(output_data, f, delimiter)
 
 
-def _compute_package_diff(result1, result2):
+def _compute_package_diff(
+    result1, result2, exclusion_packages=None, exclusion_image_name=None
+):
     """Compute the difference between two package lists.
 
     Args:
         result1: First image result with 'packages' list
         result2: Second image result with 'packages' list
+        exclusion_packages: Optional dict of packages to mark as inherited (keyed by name)
+        exclusion_image_name: Optional name of the exclusion image
 
     Returns:
         dict: Structured diff with 'added', 'removed', and 'changed' lists
@@ -235,16 +239,22 @@ def _compute_package_diff(result1, result2):
     packages1 = {pkg["name"]: pkg for pkg in result1.get("packages", [])}
     packages2 = {pkg["name"]: pkg for pkg in result2.get("packages", [])}
 
+    exclusion_names = set(exclusion_packages.keys()) if exclusion_packages else set()
+
     # Find packages only in image 2 (added)
     added = []
     for name, pkg in packages2.items():
         if name not in packages1:
             # Preserve all package fields and add change_type
             pkg_copy = pkg.copy()
-            pkg_copy["change_type"] = "ADDED"
+            if name in exclusion_names:
+                pkg_copy["change_type"] = "ADDED-INHERITED"
+                pkg_copy["inherited_from"] = exclusion_image_name
+            else:
+                pkg_copy["change_type"] = "ADDED"
             added.append(pkg_copy)
 
-    # Find packages only in image 1 (removed)
+    # Find packages only in image 1 (removed) - NO exclusion logic
     removed = []
     for name, pkg in packages1.items():
         if name not in packages2:
@@ -253,7 +263,7 @@ def _compute_package_diff(result1, result2):
             pkg_copy["change_type"] = "REMOVED"
             removed.append(pkg_copy)
 
-    # Find packages in both but with different versions (changed)
+    # Find packages in both but with different versions (changed) - NO exclusion logic
     changed = []
     for name in packages1:
         if name in packages2:
@@ -287,7 +297,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
         file_handle: File handle to write to
         delimiter: CSV column delimiter (default: ",")
     """
-    # Use same fieldnames as regular output, but add change_type and version_from
+    # Use same fieldnames as regular output, but add change_type, version_from, and inherited_from
     fieldnames = [
         "change_type",
         "name",
@@ -301,6 +311,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
         "source_code_url",
         "is_dependency",
         "parent_packages",
+        "inherited_from",
     ]
 
     # Determine appropriate separator for parent_packages field
@@ -317,7 +328,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
     all_packages.extend(diff_data["removed"])
     all_packages.extend(diff_data["changed"])
 
-    # Sort by change_type (ADDED, CHANGED, REMOVED) and then by name
+    # Sort by change_type (ADDED, ADDED-INHERITED, CHANGED, REMOVED) and then by name
     all_packages.sort(key=lambda x: (x["change_type"], x["name"]))
 
     for pkg in all_packages:
@@ -338,6 +349,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
             "parent_packages": _sanitize_csv_value(
                 parent_separator.join(pkg.get("parent_packages", []))
             ),
+            "inherited_from": _sanitize_csv_value(pkg.get("inherited_from", "")),
         }
         writer.writerow(row)
 
@@ -478,6 +490,12 @@ Examples:
         help='CSV column delimiter (default: ","). Common values: "," (comma), ";" (semicolon), "\\t" (tab), "|" (pipe)',
     )
 
+    parser.add_argument(
+        "--exclude-packages-from-image",
+        metavar="IMAGE",
+        help="Exclude packages present in this base image by marking them as INHERITED in diff output",
+    )
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -514,6 +532,10 @@ Examples:
                 parser.error(
                     "--diff cannot be used with multiple architectures. Use inline architecture syntax (e.g., image:tag/arch) for each image"
                 )
+
+        # Validate --exclude-packages-from-image requirements
+        if args.exclude_packages_from_image and not args.diff:
+            parser.error("--exclude-packages-from-image requires --diff mode")
 
         inspector = DockerImageInspector(verbose=args.verbose)
         results = []
@@ -566,10 +588,48 @@ Examples:
                     )
                 raise
 
+        # Inspect exclusion image if provided (only in diff mode)
+        exclusion_packages = None
+        exclusion_image_name = None
+        if args.diff and args.exclude_packages_from_image:
+            # Parse exclusion image name and architecture
+            excl_image, excl_arch = _parse_image_with_arch(
+                args.exclude_packages_from_image
+            )
+
+            # Use inline arch if specified, otherwise use same arch as first compared image
+            excl_architecture = excl_arch if excl_arch else results[0]["architecture"]
+
+            if args.verbose:
+                print(
+                    f"\nInspecting exclusion image: {excl_image}",
+                    file=sys.stderr,
+                )
+                if excl_architecture:
+                    print(f"Architecture: {excl_architecture}", file=sys.stderr)
+
+            exclusion_image_name = args.exclude_packages_from_image
+            exclusion_result = inspector.inspect_image(
+                image_name=excl_image, architecture=excl_architecture, pull=args.pull
+            )
+            exclusion_packages = {
+                pkg["name"]: pkg for pkg in exclusion_result.get("packages", [])
+            }
+            if args.verbose:
+                print(
+                    f"Found {len(exclusion_packages)} packages in exclusion image",
+                    file=sys.stderr,
+                )
+
         # Create output data
         if args.diff:
             # Diff mode - compare the two images
-            diff_result = _compute_package_diff(results[0], results[1])
+            diff_result = _compute_package_diff(
+                results[0],
+                results[1],
+                exclusion_packages=exclusion_packages,
+                exclusion_image_name=exclusion_image_name,
+            )
 
             output_data = {
                 "version": __version__,
@@ -597,6 +657,15 @@ Examples:
                 },
                 "differences": diff_result,
             }
+
+            # Add exclusion image info if provided
+            if exclusion_image_name:
+                output_data["exclusion_image"] = {
+                    "name": exclusion_image_name,
+                    "total_packages": len(exclusion_packages)
+                    if exclusion_packages
+                    else 0,
+                }
         else:
             # Normal mode - list all packages
             # Calculate unique images and architectures
