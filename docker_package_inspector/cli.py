@@ -50,6 +50,89 @@ def _parse_image_with_arch(image_str):
     return (image_str, None)
 
 
+def _sanitize_image_name_for_filename(image_name):
+    """Sanitize image name to create a valid filename.
+
+    Args:
+        image_name: Docker image name (e.g., "python:3.11", "ubuntu:22.04")
+
+    Returns:
+        str: Sanitized name suitable for filename (e.g., "python_3.11", "ubuntu_22.04")
+    """
+    # Replace special characters with underscores
+    # Replace : / . - with underscores, and remove other special chars
+    sanitized = image_name.replace(":", "_").replace("/", "_").replace(".", "_")
+    # Remove any other special characters that might cause issues
+    import re
+
+    sanitized = re.sub(r"[^\w\-_]", "_", sanitized)
+    # Collapse multiple underscores into single underscore
+    sanitized = re.sub(r"_+", "_", sanitized)
+    # Remove leading/trailing underscores
+    sanitized = sanitized.strip("_")
+    return sanitized
+
+
+def _generate_default_output_filename(image_specs, inspection_tasks, is_diff=False):
+    """Generate default output filename based on images, architectures, and action.
+
+    Args:
+        image_specs: List of (image_name, arch) tuples
+        inspection_tasks: List of (image_name, arch) tuples for all inspections
+        is_diff: Whether this is a diff operation
+
+    Returns:
+        tuple: (json_filename, csv_filename)
+    """
+    if is_diff:
+        # Diff mode: image1_vs_image2_arch_diff.json
+        img1_name, img1_arch = inspection_tasks[0]
+        img2_name, img2_arch = inspection_tasks[1]
+
+        sanitized_img1 = _sanitize_image_name_for_filename(img1_name)
+        sanitized_img2 = _sanitize_image_name_for_filename(img2_name)
+
+        # Add architecture if specified
+        arch_part = ""
+        if img1_arch:
+            arch_part = f"_{img1_arch}"
+
+        base_filename = f"diff_{sanitized_img1}_vs_{sanitized_img2}{arch_part}"
+    else:
+        # Regular scan mode
+        if len(image_specs) == 1 and len(inspection_tasks) == 1:
+            # Single image, single architecture
+            img_name, arch = inspection_tasks[0]
+            sanitized_img = _sanitize_image_name_for_filename(img_name)
+            arch_part = f"_{arch}" if arch else ""
+            base_filename = f"{sanitized_img}{arch_part}"
+        else:
+            # Multiple images or architectures
+            # Use first image name and indicate multi
+            img_name = image_specs[0][0]
+            sanitized_img = _sanitize_image_name_for_filename(img_name)
+
+            num_images = len(set(img for img, _ in image_specs))
+            num_archs = len(
+                set(arch for _, arch in inspection_tasks if arch is not None)
+            )
+
+            if num_images > 1 and num_archs > 1:
+                base_filename = f"{sanitized_img}_and_{num_images-1}_more_multi_arch"
+            elif num_images > 1:
+                base_filename = f"{sanitized_img}_and_{num_images-1}_more"
+            elif num_archs > 1:
+                base_filename = f"{sanitized_img}_multi_arch"
+            else:
+                base_filename = sanitized_img
+
+    # Use /tmp/ as default output location
+    json_filename = f"/tmp/{base_filename}.json"
+    csv_filename = f"/tmp/{base_filename}.csv"
+
+    return json_filename, csv_filename
+
+
 def _get_parent_packages_separator(csv_delimiter):
     """Determine appropriate separator for parent_packages field based on CSV delimiter.
 
@@ -399,11 +482,11 @@ Examples:
   docker-package-inspector --images "unbuntu:24.04/amd64,python:3.11/arm64"
 
   # Output formats
-  docker-package-inspector --image python:3.11/amd64 --output packages.json --csv-output packages.csv
+  docker-package-inspector --image python:3.11/amd64 --json-output packages.json --csv-output packages.csv
 
   # Diff mode - compare two images
   docker-package-inspector --diff --image python:3.11 --image python:3.12
-  docker-package-inspector --diff --image ubuntu:22.04/amd64 --image ubuntu:24.04/amd64 --output diff.json
+  docker-package-inspector --diff --image ubuntu:22.04/amd64 --image ubuntu:24.04/amd64 --json-output diff.json
         """,
     )
 
@@ -438,24 +521,16 @@ Examples:
     )
 
     parser.add_argument(
-        "--output",
+        "--json-output",
         "-o",
         default=None,
-        help="Output JSON file path. If not specified, prints JSON to stdout",
+        help="Output JSON file path. If not specified, uses auto-generated filename in /tmp/",
     )
 
     parser.add_argument(
         "--csv-output",
         default=None,
-        help="Output CSV file path. Can be used alongside --output for dual format export",
-    )
-
-    parser.add_argument(
-        "--format",
-        "-f",
-        choices=["json", "csv"],
-        default="json",
-        help="Output format for stdout: json or csv (default: json). Ignored if --output or --csv-output is specified",
+        help="Output CSV file path. If not specified, uses auto-generated filename in /tmp/",
     )
 
     parser.add_argument(
@@ -685,46 +760,42 @@ Examples:
             }
 
         # Generate output based on specified options
-        json_written = False
-        csv_written = False
+        # If no output files specified, generate default filenames
+        if not args.json_output and not args.csv_output:
+            default_json, default_csv = _generate_default_output_filename(
+                image_specs, inspection_tasks, is_diff=args.diff
+            )
+            json_output_file = default_json
+            csv_output_file = default_csv
+            if args.verbose:
+                print(
+                    f"\nNo output files specified. Using default filenames:",
+                    file=sys.stderr,
+                )
+                print(f"  JSON: {json_output_file}", file=sys.stderr)
+                print(f"  CSV:  {csv_output_file}", file=sys.stderr)
+        else:
+            json_output_file = args.json_output
+            csv_output_file = args.csv_output
 
         # Write JSON output
-        if args.output:
+        if json_output_file:
             json_output = json.dumps(output_data, indent=2)
-            with open(args.output, "w", encoding="utf-8") as f:
+            with open(json_output_file, "w", encoding="utf-8") as f:
                 f.write(json_output)
-            if args.verbose:
-                print(f"JSON output written to: {args.output}", file=sys.stderr)
-            json_written = True
+            if args.verbose or not args.json_output:
+                print(f"JSON output written to: {json_output_file}", file=sys.stderr)
 
         # Write CSV output
-        if args.csv_output:
+        if csv_output_file:
             if args.diff:
                 _write_diff_csv(
-                    output_data["differences"], args.csv_output, args.delimiter
+                    output_data["differences"], csv_output_file, args.delimiter
                 )
             else:
-                _write_csv(output_data, args.csv_output, args.delimiter)
-            if args.verbose:
-                print(f"CSV output written to: {args.csv_output}", file=sys.stderr)
-            csv_written = True
-
-        # If no file output was specified, write to stdout based on format
-        if not json_written and not csv_written:
-            if args.format == "json":
-                output_content = json.dumps(output_data, indent=2)
-                print(output_content)
-            elif args.format == "csv":
-                import io
-
-                output = io.StringIO()
-                if args.diff:
-                    _write_diff_csv_to_file(
-                        output_data["differences"], output, args.delimiter
-                    )
-                else:
-                    _write_csv_to_file(output_data, output, args.delimiter)
-                print(output.getvalue(), end="")
+                _write_csv(output_data, csv_output_file, args.delimiter)
+            if args.verbose or not args.csv_output:
+                print(f"CSV output written to: {csv_output_file}", file=sys.stderr)
 
         return 0
 
