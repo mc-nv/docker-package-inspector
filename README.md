@@ -88,18 +88,20 @@ Export to both JSON and CSV simultaneously:
 docker-package-inspector --image python:3.11-slim --output packages.json --csv-output packages.csv
 ```
 
-Customize the separator for parent_packages field in CSV output:
+Customize the CSV column delimiter:
 
 ```bash
-# Use comma separator
-docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator ","
+# Use semicolon delimiter (common in Europe)
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --delimiter ";"
 
-# Use pipe separator
-docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator "|"
+# Use tab delimiter (TSV format)
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --delimiter $'\t'
 
-# Use custom string
-docker-package-inspector --image python:3.11-slim --csv-output packages.csv --separator " / "
+# Use pipe delimiter
+docker-package-inspector --image python:3.11-slim --csv-output packages.csv --delimiter "|"
 ```
+
+Note: `--separator` can also be used as an alias for `--delimiter`. The `parent_packages` field separator is automatically chosen based on the CSV delimiter to avoid conflicts.
 
 ### Inline Architecture Specification
 
@@ -219,7 +221,7 @@ CSV format is ideal for importing into spreadsheets, databases, or data analysis
 - `license` - Package license
 - `source_code_url` - Source code repository URL
 - `is_dependency` - True/False
-- `parent_packages` - Semicolon-separated list of parent packages (separator can be customized with `--separator`)
+- `parent_packages` - List of parent packages (separator adapts based on CSV delimiter set by `--delimiter`)
 
 ### Analyzing the Output
 

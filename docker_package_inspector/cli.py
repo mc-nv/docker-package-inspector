@@ -50,6 +50,26 @@ def _parse_image_with_arch(image_str):
     return (image_str, None)
 
 
+def _get_parent_packages_separator(csv_delimiter):
+    """Determine appropriate separator for parent_packages field based on CSV delimiter.
+
+    Args:
+        csv_delimiter: The CSV column delimiter
+
+    Returns:
+        str: Appropriate separator for parent_packages field
+    """
+    # Map common CSV delimiters to parent_packages separators
+    # Use a separator that won't conflict with the CSV delimiter
+    separator_map = {
+        ",": "; ",  # Comma CSV -> semicolon for parent_packages
+        ";": ", ",  # Semicolon CSV -> comma for parent_packages
+        "\t": ", ",  # Tab CSV -> comma for parent_packages
+        "|": ", ",  # Pipe CSV -> comma for parent_packages
+    }
+    return separator_map.get(csv_delimiter, "; ")
+
+
 def _sanitize_csv_value(value):
     """Remove newlines, carriage returns, and tabs from CSV values.
 
@@ -126,13 +146,13 @@ def _truncate_license(license_text, max_length=200):
     return license_text
 
 
-def _write_csv_to_file(output_data, file_handle, separator="; "):
+def _write_csv_to_file(output_data, file_handle, delimiter=","):
     """Write package data to CSV file handle.
 
     Args:
         output_data: Package data to write
         file_handle: File handle to write to
-        separator: Separator to use for parent_packages field (default: "; ")
+        delimiter: CSV column delimiter (default: ",")
     """
     fieldnames = [
         "image",
@@ -150,7 +170,10 @@ def _write_csv_to_file(output_data, file_handle, separator="; "):
         "parent_packages",
     ]
 
-    writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+    # Determine appropriate separator for parent_packages field
+    parent_separator = _get_parent_packages_separator(delimiter)
+
+    writer = csv.DictWriter(file_handle, fieldnames=fieldnames, delimiter=delimiter)
     writer.writeheader()
 
     # Handle both old single-result and new multi-result formats
@@ -180,22 +203,22 @@ def _write_csv_to_file(output_data, file_handle, separator="; "):
                 ),
                 "is_dependency": package.get("is_dependency", False),
                 "parent_packages": _sanitize_csv_value(
-                    separator.join(package.get("parent_packages", []))
+                    parent_separator.join(package.get("parent_packages", []))
                 ),
             }
             writer.writerow(row)
 
 
-def _write_csv(output_data, filename, separator="; "):
+def _write_csv(output_data, filename, delimiter=","):
     """Write package data to CSV file.
 
     Args:
         output_data: Package data to write
         filename: Output file path
-        separator: Separator to use for parent_packages field (default: "; ")
+        delimiter: CSV column delimiter (default: ",")
     """
     with open(filename, "w", encoding="utf-8", newline="") as f:
-        _write_csv_to_file(output_data, f, separator)
+        _write_csv_to_file(output_data, f, delimiter)
 
 
 def _compute_package_diff(result1, result2):
@@ -256,13 +279,13 @@ def _compute_package_diff(result1, result2):
     }
 
 
-def _write_diff_csv_to_file(diff_data, file_handle, separator="; "):
+def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
     """Write diff data to CSV file handle.
 
     Args:
         diff_data: Diff data to write
         file_handle: File handle to write to
-        separator: Separator to use for parent_packages field (default: "; ")
+        delimiter: CSV column delimiter (default: ",")
     """
     # Use same fieldnames as regular output, but add change_type and version_from
     fieldnames = [
@@ -280,7 +303,12 @@ def _write_diff_csv_to_file(diff_data, file_handle, separator="; "):
         "parent_packages",
     ]
 
-    writer = csv.DictWriter(file_handle, fieldnames=fieldnames, extrasaction="ignore")
+    # Determine appropriate separator for parent_packages field
+    parent_separator = _get_parent_packages_separator(delimiter)
+
+    writer = csv.DictWriter(
+        file_handle, fieldnames=fieldnames, delimiter=delimiter, extrasaction="ignore"
+    )
     writer.writeheader()
 
     # Write all packages (added, removed, changed) with preserved fields
@@ -308,22 +336,22 @@ def _write_diff_csv_to_file(diff_data, file_handle, separator="; "):
             "source_code_url": _sanitize_csv_value(pkg.get("source_code_url", "")),
             "is_dependency": pkg.get("is_dependency", False),
             "parent_packages": _sanitize_csv_value(
-                separator.join(pkg.get("parent_packages", []))
+                parent_separator.join(pkg.get("parent_packages", []))
             ),
         }
         writer.writerow(row)
 
 
-def _write_diff_csv(diff_data, filename, separator="; "):
+def _write_diff_csv(diff_data, filename, delimiter=","):
     """Write diff data to CSV file.
 
     Args:
         diff_data: Diff data to write
         filename: Output file path
-        separator: Separator to use for parent_packages field (default: "; ")
+        delimiter: CSV column delimiter (default: ",")
     """
     with open(filename, "w", encoding="utf-8", newline="") as f:
-        _write_diff_csv_to_file(diff_data, f, separator)
+        _write_diff_csv_to_file(diff_data, f, delimiter)
 
 
 def main():
@@ -443,9 +471,11 @@ Examples:
     )
 
     parser.add_argument(
+        "--delimiter",
         "--separator",
-        default="; ",
-        help='Separator to use for parent_packages field in CSV output (default: "; ")',
+        dest="delimiter",
+        default=",",
+        help='CSV column delimiter (default: ","). Common values: "," (comma), ";" (semicolon), "\\t" (tab), "|" (pipe)',
     )
 
     args = parser.parse_args()
@@ -602,10 +632,10 @@ Examples:
         if args.csv_output:
             if args.diff:
                 _write_diff_csv(
-                    output_data["differences"], args.csv_output, args.separator
+                    output_data["differences"], args.csv_output, args.delimiter
                 )
             else:
-                _write_csv(output_data, args.csv_output, args.separator)
+                _write_csv(output_data, args.csv_output, args.delimiter)
             if args.verbose:
                 print(f"CSV output written to: {args.csv_output}", file=sys.stderr)
             csv_written = True
@@ -621,10 +651,10 @@ Examples:
                 output = io.StringIO()
                 if args.diff:
                     _write_diff_csv_to_file(
-                        output_data["differences"], output, args.separator
+                        output_data["differences"], output, args.delimiter
                     )
                 else:
-                    _write_csv_to_file(output_data, output, args.separator)
+                    _write_csv_to_file(output_data, output, args.delimiter)
                 print(output.getvalue(), end="")
 
         return 0
