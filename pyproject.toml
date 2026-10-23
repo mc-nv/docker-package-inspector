@@ -31,3 +31,6 @@ docker-package-inspector = "docker_package_inspector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yourusername/docker-package-inspector"
+
+[tool.isort]
+profile = "black"
