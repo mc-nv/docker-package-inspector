@@ -10,6 +10,7 @@ from docker.errors import APIError, DockerException, ImageNotFound
 from .package_metadata import PackageMetadataFetcher
 from .python_dists import (
     DIST_SCAN_SCRIPT,
+    extract_copyright_lines,
     group_dists,
     local_license,
     local_license_fallback,
@@ -25,7 +26,11 @@ PACKAGE_DEFAULTS = {
     "license_files": list,
     "copyright": list,
     "is_private_env": lambda: False,
+    "owning_dpkg": str,
 }
+
+# DEP-5 copyright files of large packages list hundreds of holders
+MAX_COPYRIGHT_LINES = 50
 
 
 class DockerImageInspector:
@@ -149,6 +154,8 @@ class DockerImageInspector:
             for pkg in all_packages:
                 for field, default in PACKAGE_DEFAULTS.items():
                     pkg.setdefault(field, default())
+
+            self._link_python_to_dpkg(container, all_packages)
 
             # Post-process: Check source URLs for packages with unknown licenses
             self._enrich_unknown_licenses(all_packages, container)
@@ -436,9 +443,12 @@ class DockerImageInspector:
                     source = parts[3] if len(parts) > 3 else name
 
                     # Get license info
-                    license_info, license_source = self._get_dpkg_license(
-                        container, name
-                    )
+                    (
+                        license_info,
+                        license_source,
+                        license_files,
+                        copyright_lines,
+                    ) = self._get_dpkg_license(container, name)
 
                     packages.append(
                         {
@@ -449,6 +459,8 @@ class DockerImageInspector:
                             "license_source": license_source,
                             "source_code_url": homepage,
                             "package_provider": "dpkg",
+                            "license_files": license_files,
+                            "copyright": copyright_lines,
                         }
                     )
 
@@ -460,19 +472,111 @@ class DockerImageInspector:
     def _get_dpkg_license(self, container, package_name):
         """Get license information for a dpkg package.
 
+        Uses /usr/share/doc/<package>/copyright when present. Packages that
+        install no copyright file (vendor packages such as Nsight or DPDK
+        builds) fall back to license-like files the package itself owns.
+
         Returns:
-            Tuple of (license_info, license_source)
+            Tuple of (license_info, license_source, license_files,
+            copyright_lines)
         """
         try:
             copyright_file = f"/usr/share/doc/{package_name}/copyright"
             exit_code, output = container.exec_run(f"cat {copyright_file}", demux=False)
-            if exit_code == 0:
+            if exit_code == 0 and output:
                 content = output.decode("utf-8", errors="ignore")
                 license_info = self._parse_copyright_file(content)
-                return license_info, copyright_file
-        except:
-            pass
-        return "Unknown", "Not found"
+                return (
+                    license_info,
+                    copyright_file,
+                    [copyright_file],
+                    extract_copyright_lines(content.splitlines())[:MAX_COPYRIGHT_LINES],
+                )
+        except Exception as e:
+            self._log(f"  Warning: Failed to read {package_name} copyright: {e}")
+
+        license_files = self._dpkg_owned_license_files(container, package_name)
+        if license_files:
+            result = self._license_from_files(container, license_files)
+            if result:
+                return result[0], result[1], license_files, []
+            return "Unknown", "Not detected in package files", license_files, []
+        return "Unknown", "Not found", [], []
+
+    def _dpkg_owned_license_files(self, container, package_name):
+        """Non-empty license/EULA/notice files installed by a dpkg package."""
+        try:
+            exit_code, output = container.exec_run(
+                [
+                    "sh",
+                    "-c",
+                    'dpkg-query -L "$1" 2>/dev/null'
+                    " | grep -iE '/[^/]*(licen[cs]e|copying|eula|notice)[^/]*$'"
+                    ' | while IFS= read -r f; do [ -f "$f" ] && [ -s "$f" ]'
+                    ' && printf "%s\\n" "$f"; done',
+                    "sh",
+                    package_name,
+                ],
+                demux=False,
+            )
+            if exit_code != 0 or not output:
+                return []
+            return output.decode("utf-8", errors="ignore").splitlines()
+        except Exception as e:
+            self._log(f"  Warning: Failed to list files of {package_name}: {e}")
+            return []
+
+    def _link_python_to_dpkg(self, container, packages):
+        """Set owning_dpkg on Python dists installed by Debian packages.
+
+        Distro-packaged modules (python3-pip, python3-setuptools, ...) often
+        ship no license in their dist-info; their license lives in the owning
+        package's copyright file, which is merged into the Python row.
+
+        Args:
+            container: Docker container object
+            packages: All package dictionaries of the image (modified in place)
+        """
+        path_to_python = {}
+        for pkg in packages:
+            if pkg["package_type"] != "python":
+                continue
+            for path in pkg.get("install_path", []):
+                if path.startswith("/usr/lib/"):
+                    path_to_python[path] = pkg
+        if not path_to_python:
+            return
+
+        try:
+            _, output = container.exec_run(
+                ["dpkg-query", "-S"] + list(path_to_python), demux=False
+            )
+        except Exception as e:
+            self._log(f"Warning: dpkg ownership lookup failed: {e}")
+            return
+
+        dpkg_rows = {
+            pkg["name"]: pkg for pkg in packages if pkg["package_provider"] == "dpkg"
+        }
+        for line in (output or b"").decode("utf-8", errors="ignore").splitlines():
+            if line.startswith("diversion by "):
+                continue
+            owners, sep, path = line.partition(": ")
+            pkg = path_to_python.get(path.strip())
+            if not sep or pkg is None or pkg.get("owning_dpkg"):
+                continue
+            owner = owners.split(",")[0].strip().split(":")[0]
+            pkg["owning_dpkg"] = owner
+            dpkg_row = dpkg_rows.get(owner)
+            if dpkg_row is None:
+                continue
+            for field in ("license_files", "copyright"):
+                for value in dpkg_row.get(field, []):
+                    if value not in pkg[field]:
+                        pkg[field].append(value)
+            if pkg.get("license") == "Unknown" and dpkg_row["license"] != "Unknown":
+                pkg["license"] = dpkg_row["license"]
+                pkg["license_source"] = f"dpkg {owner}: {dpkg_row['license_source']}"
 
     def _parse_copyright_file(self, content):
         """Parse copyright file to extract license information.
@@ -561,7 +665,8 @@ class DockerImageInspector:
                 licenses.extend(parsed)
 
         if licenses:
-            return " | ".join(licenses)
+            # DEP-5 files repeat the same License: stanza per Files: block
+            return " | ".join(dict.fromkeys(licenses))
 
         return "Unknown"
 
@@ -670,7 +775,7 @@ class DockerImageInspector:
 
             licenses.append(clean_license)
 
-        return licenses
+        return list(dict.fromkeys(licenses))
 
     def _enrich_unknown_licenses(self, packages, container):
         """Try to find licenses for packages with unknown licenses.

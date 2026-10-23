@@ -236,6 +236,7 @@ EXTENDED_FIELDS = [
     "license_files",
     "copyright",
     "is_private_env",
+    "owning_dpkg",
 ]
 
 
