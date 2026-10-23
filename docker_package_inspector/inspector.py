@@ -1,8 +1,10 @@
 """Docker image inspection logic."""
 
+import io
 import json
 import signal
 import sys
+import tarfile
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound
@@ -10,6 +12,7 @@ from docker.errors import APIError, DockerException, ImageNotFound
 from .package_metadata import PackageMetadataFetcher
 from .python_dists import (
     DIST_SCAN_SCRIPT,
+    dist_info_version,
     extract_copyright_lines,
     group_dists,
     local_license,
@@ -17,6 +20,21 @@ from .python_dists import (
     normalize_name,
     parse_dist_scan,
     project_url,
+)
+from .rust_crates import (
+    CARGO_FILES_SCRIPT,
+    RECORD_LOOKUP_SCRIPT,
+    RUST_HOSTS_SCRIPT,
+    git_repository,
+    is_crates_io,
+    maturin_module_name,
+    module_stem,
+    parse_auditable,
+    parse_hosts,
+    resolve_project_crates,
+    resolve_record_owners,
+    sdist_project_files,
+    split_files,
 )
 
 # Fields every package row carries, with their defaults, so JSON and CSV
@@ -36,13 +54,15 @@ MAX_COPYRIGHT_LINES = 50
 class DockerImageInspector:
     """Inspects Docker images and extracts package information."""
 
-    def __init__(self, verbose=False):
+    def __init__(self, verbose=False, scan_rust=True):
         """Initialize the inspector.
 
         Args:
             verbose: Enable verbose logging
+            scan_rust: Attribute Rust crates linked into binaries in the image
         """
         self.verbose = verbose
+        self.scan_rust = scan_rust
         self.client = None
         self.metadata_fetcher = PackageMetadataFetcher()
 
@@ -151,6 +171,11 @@ class DockerImageInspector:
                         if pkg_name not in pkg["parent_packages"]:
                             pkg["parent_packages"].append(pkg_name)
 
+            if self.scan_rust:
+                all_packages.extend(
+                    self._extract_rust_crates(container, python_packages)
+                )
+
             for pkg in all_packages:
                 for field, default in PACKAGE_DEFAULTS.items():
                     pkg.setdefault(field, default())
@@ -243,6 +268,224 @@ class DockerImageInspector:
 
         self._log(f"Found {len(packages)} Python packages")
         return packages, dependencies
+
+    def _exec_text(self, container, script, *args):
+        """Run a /bin/sh script in the container and return its stdout.
+
+        The exit status is ignored (grep/find pipelines exit non-zero when
+        nothing matches); an exec failure returns an empty string.
+        """
+        try:
+            _, output = container.exec_run(
+                ["sh", "-c", script, "sh"] + list(args), demux=True
+            )
+        except Exception as e:
+            self._log(f"Warning: exec in container failed: {e}")
+            return ""
+        stdout = output[0] if isinstance(output, tuple) else output
+        return (stdout or b"").decode("utf-8", errors="ignore")
+
+    def _read_container_file(self, container, path, max_bytes=512 * 1024 * 1024):
+        """Copy one file out of the container into memory.
+
+        Returns:
+            File content as bytes, or None if unreadable or larger than max_bytes
+        """
+        try:
+            stream, stat = container.get_archive(path)
+            if stat.get("size", 0) > max_bytes:
+                return None
+            archive = io.BytesIO()
+            for chunk in stream:
+                archive.write(chunk)
+            archive.seek(0)
+            with tarfile.open(fileobj=archive) as tar:
+                member = tar.next()
+                handle = tar.extractfile(member) if member else None
+                return handle.read() if handle else None
+        except Exception as e:
+            self._log(f"  Warning: Failed to copy {path}: {e}")
+            return None
+
+    def _extract_rust_crates(self, container, python_packages):
+        """Attribute Rust crates to the binaries that statically link them.
+
+        Args:
+            container: Docker container object
+            python_packages: Python package rows, used to find which wheel
+                installed each Rust binary
+
+        Returns:
+            List of package dictionaries: one "rust" row per crate, and one
+            "rust-binary" row per Rust binary whose crates could not be
+            resolved
+        """
+        self._log("Scanning for Rust binaries...")
+        hosts = parse_hosts(self._exec_text(container, RUST_HOSTS_SCRIPT))
+        if not hosts:
+            return []
+        self._log(f"Found {len(hosts)} Rust binaries")
+
+        host_owner = self._rust_host_owners(container, hosts, python_packages)
+        cargo_files = split_files(self._exec_text(container, CARGO_FILES_SCRIPT))
+
+        crates = {}
+        unresolved = []
+        sdist_cache = {}
+        for path, auditable in hosts:
+            owner = host_owner.get(path)
+            found, provider = None, None
+
+            if auditable:
+                found = self._auditable_crates(container, path)
+                provider = "cargo-auditable"
+            if found is None and cargo_files:
+                found, lock = resolve_project_crates(cargo_files, module_stem(path))
+                provider = f"Cargo.lock(image): {lock}"
+            if found is None and owner is not None:
+                key = (owner["name"], owner["version"])
+                if key not in sdist_cache:
+                    sdist_cache[key] = self._sdist_files(*key)
+                files = sdist_cache[key]
+                if files:
+                    module_name = next(
+                        (
+                            maturin_module_name(text)
+                            for name, text in sorted(files.items())
+                            if name.endswith("/pyproject.toml")
+                        ),
+                        "",
+                    )
+                    found, _ = resolve_project_crates(
+                        files, module_stem(path), module_name, allow_single_cdylib=True
+                    )
+                    provider = f"Cargo.lock(sdist): {owner['name']}=={owner['version']}"
+
+            if found is None:
+                unresolved.append(self._unresolved_rust_binary(path, owner))
+                continue
+            self._log(f"  {path}: {len(found)} crates via {provider}")
+            for crate in found:
+                self._add_crate(crates, crate, path, provider.split(":")[0])
+
+        self._log(
+            f"Resolved {len(crates)} crates; {len(unresolved)} Rust binaries "
+            "unresolved"
+        )
+        return sorted(crates.values(), key=lambda c: c["name"]) + unresolved
+
+    def _rust_host_owners(self, container, hosts, python_packages):
+        """Map Rust binary paths to the Python package that installed them."""
+        dist_to_pkg = {}
+        for pkg in python_packages:
+            for dist_path in pkg.get("install_path", []):
+                if dist_path.endswith(".dist-info"):
+                    dist_to_pkg[dist_path] = pkg
+        if not dist_to_pkg:
+            return {}
+        paths = [path for path, _ in hosts]
+        output = self._exec_text(
+            container,
+            RECORD_LOOKUP_SCRIPT,
+            *(paths + ["--"] + [d + "/RECORD" for d in dist_to_pkg]),
+        )
+        owners = {}
+        for host, dist_info in resolve_record_owners(output, paths).items():
+            pkg = dist_to_pkg[dist_info]
+            version = dist_info_version(dist_info) or pkg["version"].split(", ")[0]
+            owners[host] = {"name": pkg["name"], "version": version}
+        return owners
+
+    def _auditable_crates(self, container, path):
+        """Runtime crates recorded by cargo-auditable in a binary, or None."""
+        elf = self._read_container_file(container, path)
+        deps = parse_auditable(elf) if elf else None
+        if deps is None:
+            return None
+        return [
+            {"name": d["name"], "version": d["version"], "source": d["source"]}
+            for d in deps
+            if not d["root"] and d["kind"] != "build" and d["source"] != "local"
+        ]
+
+    def _sdist_files(self, name, version):
+        """Cargo/pyproject files from the PyPI sdist of a release, or {}."""
+        url = self.metadata_fetcher.get_pypi_sdist_url(name, version)
+        if not url:
+            return {}
+        archive = self.metadata_fetcher.fetch_bytes(url)
+        if not archive:
+            return {}
+        try:
+            return sdist_project_files(archive)
+        except Exception as e:
+            self._log(f"  Warning: Failed to read sdist {url}: {e}")
+            return {}
+
+    def _add_crate(self, crates, crate, host_path, provider):
+        """Merge one crate occurrence into the per-name crate rows."""
+        name, version, source = crate["name"], crate["version"], crate["source"]
+        if is_crates_io(source):
+            meta = self.metadata_fetcher.get_crate_metadata(
+                name, version, crate.get("checksum", "")
+            )
+            url = f"https://crates.io/crates/{name}/{version}"
+        else:
+            meta = {
+                "license": "Unknown",
+                "license_source": "Not a crates.io crate",
+                "repository": git_repository(source),
+                "copyright": [],
+            }
+            url = git_repository(source) or source
+
+        row = crates.get(name)
+        if row is None:
+            row = crates[name] = {
+                "name": name,
+                "version": version,
+                "source": url,
+                "license": meta["license"],
+                "license_source": meta["license_source"],
+                "source_code_url": meta["repository"],
+                "package_provider": provider,
+                "package_type": "rust",
+                "is_dependency": True,
+                "parent_packages": [],
+                "copyright": [],
+            }
+        else:
+            versions = row["version"].split(", ")
+            if version not in versions:
+                row["version"] = ", ".join(sorted(versions + [version]))
+            licenses = row["license"].split(" | ")
+            if meta["license"] not in licenses:
+                row["license"] = " | ".join(licenses + [meta["license"]])
+            providers = row["package_provider"].split(", ")
+            if provider not in providers:
+                row["package_provider"] = ", ".join(sorted(providers + [provider]))
+        if host_path not in row["parent_packages"]:
+            row["parent_packages"].append(host_path)
+        for line in meta["copyright"]:
+            if line not in row["copyright"]:
+                row["copyright"].append(line)
+
+    @staticmethod
+    def _unresolved_rust_binary(path, owner):
+        """Row for a Rust binary whose crates could not be determined."""
+        return {
+            "name": path.rsplit("/", 1)[-1],
+            "version": owner["version"] if owner else "",
+            "source": "",
+            "license": "Unknown",
+            "license_source": "No cargo-auditable data or Cargo.lock found",
+            "source_code_url": "",
+            "package_provider": "unresolved",
+            "package_type": "rust-binary",
+            "is_dependency": False,
+            "parent_packages": [owner["name"]] if owner else [],
+            "install_path": [path],
+        }
 
     def _scan_python_dists(self, container):
         """Run the dist-info filesystem scan inside the container.

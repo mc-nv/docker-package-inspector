@@ -89,6 +89,14 @@ def normalize_name(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def dist_info_version(path):
+    """Version encoded in a ``<name>-<version>.dist-info`` directory name."""
+    base = path.rstrip("/").rsplit("/", 1)[-1]
+    if not base.endswith(".dist-info") or "-" not in base:
+        return ""
+    return base[: -len(".dist-info")].rsplit("-", 1)[1]
+
+
 def is_private_env(path):
     """Return True if a distribution path belongs to a non-main environment."""
     return any(pattern.search(path) for pattern in PRIVATE_ENV_PATTERNS)

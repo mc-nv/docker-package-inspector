@@ -583,6 +583,13 @@ Examples:
     )
 
     parser.add_argument(
+        "--skip-rust-scan",
+        action="store_true",
+        help="Do not search binaries for statically linked Rust crates "
+        "(faster; crates are then missing from the report)",
+    )
+
+    parser.add_argument(
         "--diff",
         action="store_true",
         help="Compare packages between exactly two images and show differences (added, removed, changed)",
@@ -643,7 +650,9 @@ Examples:
         if args.exclude_packages_from_image and not args.diff:
             parser.error("--exclude-packages-from-image requires --diff mode")
 
-        inspector = DockerImageInspector(verbose=args.verbose)
+        inspector = DockerImageInspector(
+            verbose=args.verbose, scan_rust=not args.skip_rust_scan
+        )
         results = []
 
         # Build the list of (image, arch) combinations to inspect

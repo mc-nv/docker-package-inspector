@@ -2,9 +2,22 @@
 
 import re
 import sys
+import time
 from typing import Dict, Optional
 
 import requests
+
+from . import __version__
+from .rust_crates import crate_download_url, parse_crate_archive
+
+# crates.io asks API clients to identify themselves and stay at or below one
+# request per second; static.crates.io downloads are CDN-served and exempt
+USER_AGENT = (
+    f"docker-package-inspector/{__version__} "
+    "(+https://github.com/mc-nv/docker-package-inspector)"
+)
+CRATES_IO_API_INTERVAL = 1.0
+MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 
 
 class PackageMetadataFetcher:
@@ -18,7 +31,119 @@ class PackageMetadataFetcher:
         """
         self.timeout = timeout
         self.session = requests.Session()
+        self.session.headers["User-Agent"] = USER_AGENT
         self.cache = {}
+        self._last_crates_io_call = 0.0
+
+    def fetch_bytes(self, url: str, max_bytes: int = MAX_DOWNLOAD_BYTES):
+        """Download a URL into memory, refusing bodies larger than max_bytes.
+
+        Returns:
+            The body as bytes, or None on any error or oversize body
+        """
+        try:
+            with self.session.get(url, timeout=self.timeout, stream=True) as response:
+                if response.status_code != 200:
+                    return None
+                chunks = []
+                size = 0
+                for chunk in response.iter_content(chunk_size=65536):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
+        except Exception:
+            return None
+
+    def get_pypi_sdist_url(self, package_name: str, version: str) -> Optional[str]:
+        """URL of the source distribution of an exact PyPI release, if any."""
+        cache_key = f"sdist:{package_name}:{version}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        url = None
+        try:
+            response = self.session.get(
+                f"https://pypi.org/pypi/{package_name}/{version}/json",
+                timeout=self.timeout,
+            )
+            if response.status_code == 200:
+                for entry in response.json().get("urls", []):
+                    if entry.get("packagetype") == "sdist":
+                        url = entry.get("url")
+                        break
+        except Exception:
+            pass
+        self.cache[cache_key] = url
+        return url
+
+    def get_crate_metadata(self, name: str, version: str, checksum: str = ""):
+        """License, repository and copyright holders of a crates.io crate.
+
+        The published .crate is read in memory and, when a Cargo.lock checksum
+        is known, verified against it. The crates.io API is consulted only
+        when the crate's Cargo.toml declares no SPDX license expression.
+
+        Returns:
+            Dict with license, license_source, repository, copyright
+        """
+        cache_key = f"crate:{name}:{version}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        metadata = {
+            "license": "Unknown",
+            "license_source": "Not found",
+            "repository": "",
+            "copyright": [],
+        }
+        archive = self.fetch_bytes(crate_download_url(name, version))
+        try:
+            parsed = parse_crate_archive(archive, checksum) if archive else None
+        except Exception:
+            parsed = None
+        if archive and parsed is None:
+            metadata["license_source"] = "crate checksum mismatch"
+        if parsed:
+            metadata["repository"] = parsed["repository"]
+            metadata["copyright"] = parsed["copyright"]
+            if parsed["license"]:
+                metadata["license"] = parsed["license"]
+                metadata["license_source"] = "crate Cargo.toml"
+            else:
+                texts = parsed["license_texts"]
+                for file_name in sorted(texts):
+                    detected = self._detect_license_from_content(texts[file_name])
+                    if detected:
+                        metadata["license"] = detected
+                        metadata["license_source"] = f"crate {file_name}"
+                        break
+
+        if metadata["license"] == "Unknown":
+            api_license = self._get_crates_io_api_license(name, version)
+            if api_license:
+                metadata["license"] = api_license
+                metadata["license_source"] = "crates.io API"
+
+        self.cache[cache_key] = metadata
+        return metadata
+
+    def _get_crates_io_api_license(self, name: str, version: str) -> Optional[str]:
+        """License of a crate version from the crates.io API (rate limited)."""
+        wait = CRATES_IO_API_INTERVAL - (time.monotonic() - self._last_crates_io_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_crates_io_call = time.monotonic()
+        try:
+            response = self.session.get(
+                f"https://crates.io/api/v1/crates/{name}/{version}",
+                timeout=self.timeout,
+            )
+            if response.status_code == 200:
+                return response.json().get("version", {}).get("license") or None
+        except Exception:
+            pass
+        return None
 
     def get_pypi_metadata(
         self, package_name: str, version: Optional[str] = None

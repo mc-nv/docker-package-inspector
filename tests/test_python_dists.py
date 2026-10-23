@@ -5,6 +5,7 @@ import textwrap
 
 from docker_package_inspector.python_dists import (
     DIST_SCAN_SCRIPT,
+    dist_info_version,
     extract_copyright_lines,
     group_dists,
     installer_to_provider,
@@ -123,6 +124,12 @@ def test_private_env_rules():
     assert is_private_env("/opt/tritonserver/backends/dali/wheel/dali/x.dist-info")
     assert not is_private_env("/opt/venv-tritonserver/lib/site-packages/x")
     assert not is_private_env("/usr/local/lib/python3.12/dist-packages/x")
+
+
+def test_dist_info_version():
+    assert dist_info_version("/x/tokenizers-0.23.3.dist-info") == "0.23.3"
+    assert dist_info_version("/x/hf_xet-1.7.0.dist-info/") == "1.7.0"
+    assert dist_info_version("/x/legacy-0.1.egg-info") == ""
 
 
 def test_installer_to_provider():
