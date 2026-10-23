@@ -1,17 +1,20 @@
 # Docker Package Inspector
 
-A CLI tool to inspect Docker images and extract detailed package information including Python packages and system binary packages.
+A CLI tool to inspect Docker images and extract detailed package information, including licenses, for everything shipped in the image.
 
 ## Features
 
 - Inspect Docker images for any architecture
-- Extract Python package information (name, version, source, license)
-- Extract system binary package information (apt/dpkg, rpm/yum)
-- Query PyPI for Python package metadata
-- Output results as structured JSON
-- Support for multi-architecture images
+- Extract Python packages from their `*.dist-info` / `*.egg-info` metadata, whichever tool installed them (pip, uv, distro packages) and in any environment (system, virtualenvs, tool directories); works in images without pip or python
+- Extract system binary package information (apt/dpkg, rpm/yum, apk)
+- Attribute **Rust crates** statically linked into executables and Python extension modules (see [Rust crates](#rust-crates))
+- Extract **Java** artifacts from jar files (including shaded jar-with-dependencies) and **npm** packages from `node_modules`
+- Report OpenSSL and Python runtimes that no package manager installed (source builds, copies bundled in wheels)
+- Verified in-image license files, copyright holders and the owning Debian package for every row
+- Per-platform manifest digests for multi-architecture images
+- Optional classification of every license against a license policy file (`--license-compliance-file`)
+- Output results as structured JSON and CSV
 - **Multiple license detection** - Automatically detects and parses packages with dual or multi-licensing (e.g., "MIT or Apache-2.0")
-- **Corporate/proprietary license support** - Properly identifies and preserves corporate and proprietary license names
 
 ## Installation
 
@@ -101,7 +104,74 @@ docker-package-inspector --image python:3.11-slim --csv-output packages.csv --de
 docker-package-inspector --image python:3.11-slim --csv-output packages.csv --delimiter "|"
 ```
 
-Note: `--separator` can also be used as an alias for `--delimiter`. The `parent_packages` field separator is automatically chosen based on the CSV delimiter to avoid conflicts.
+Note: `--separator` can also be used as an alias for `--delimiter`. The `parent_packages` field separator is automatically chosen based on the CSV delimiter to avoid conflicts. The same separator joins every other list-valued column (`install_path`, `license_files`, `copyright`, `license_unmatched`).
+
+Skip the Rust crate scan (faster; crates are then missing from the report):
+
+```bash
+docker-package-inspector --image python:3.11-slim --skip-rust-scan
+```
+
+### License Policy Classification
+
+`--license-compliance-file PATH` classifies every package license against a
+policy file: a JSON object mapping a category to the license names in it
+(SPDX ids, free-form names or whole expressions):
+
+```json
+{
+  "low_risk": ["Example-Permissive-1.0", "..."],
+  "copy_left": ["Example-Copyleft-2.0", "..."],
+  "non_commercial": ["Example Non-Commercial License"]
+}
+```
+
+Matching is case and whitespace insensitive: the whole license string first,
+then each part (split on ` | `, `OR`, `AND` and the legacy Cargo `/`; `WITH`
+exceptions fall back to the base license). Each package then gets:
+
+- `license_category`: the most restrictive category among its parts
+  (`low_risk` < `copy_left` < `non_commercial` < `unknown`)
+- `osrb_review_required`: `false` only when every part is `low_risk`;
+  `Unknown` licenses and names the policy does not list always require review
+- `license_unmatched`: license parts the policy does not list
+
+In diff mode `summary.added_by_license_category` counts ADDED packages per
+category. The file is read before any image is inspected, so a missing or
+malformed file fails immediately. It is never downloaded or bundled by this
+tool. Without the option the output is unchanged.
+
+### Rust Crates
+
+Rust leaves no package record on disk, so crates are attributed per binary:
+every ELF file containing Rust standard library paths is mapped to the wheel
+that installed it (through dist-info `RECORD`), and its crates are resolved
+from, in order:
+
+1. a [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable)
+   `.dep-v0` section embedded in the binary,
+2. a `Cargo.lock` shipped in the image next to the matching crate,
+3. the `Cargo.lock` in the PyPI sdist of the installed wheel version.
+
+The dependency graph is walked from the crate that builds the module,
+excluding its own dev/build dependencies. Transitive build-time crates
+(proc-macros) cannot be told apart from a `Cargo.lock` alone and are kept, so
+the list may over-report but not under-report. Binaries whose crates cannot be
+resolved are reported as `rust-binary` rows with an `Unknown` license.
+License, repository and copyright holders come from the published `.crate`,
+verified against the `Cargo.lock` checksum.
+
+### Network Access
+
+Besides the Docker daemon and registry, the tool contacts: PyPI (package
+metadata and sdists), `static.crates.io` (published crates), `crates.io` (API
+fallback, at most one request per second), Maven Central (POMs) and GitHub /
+GitLab (license lookups by source URL). All requests identify the tool with a
+`docker-package-inspector/<version>` User-Agent. Downloaded archives are read
+in memory and never extracted or executed. Per-platform digests use
+`docker manifest inspect`, so the docker CLI and registry credentials must be
+available where the tool runs; without them the previous digest is kept and a
+warning is logged.
 
 ### Inline Architecture Specification
 
@@ -492,22 +562,37 @@ When inspecting multiple images or architectures, the structure changes to:
 
 ### Package Fields
 
-- `name`: Package name
-- `version`: Package version
-- `source`: PyPI URL for Python packages, repository for binary packages
-- `license`: Package license. For packages with multiple licenses, they are separated by ` | ` (e.g., "MIT | Apache-2.0"). Corporate and proprietary licenses are preserved with their full names (e.g., "NVIDIA Proprietary License").
+- `name`: Package name (`group:artifact` for Maven artifacts)
+- `version`: Package version; versions of copies found in several places are joined with `, `
+- `source`: Registry page of the package (PyPI, crates.io, Maven Central, npm) or repository
+- `license`: Package license. For packages with multiple licenses, they are separated by ` | ` (e.g., "MIT | Apache-2.0"). Never guessed: `Unknown` when no license could be established.
+- `license_source`: Where the license came from (metadata field, file path, API)
 - `source_code_url`: URL to source code repository
-- `package_type`: Either "python" or "binary"
+- `package_type`: `python`, `binary`, `rust`, `rust-binary`, `java` or `npm`
+- `package_provider`: What installed it: `PIP`, `uv`, `dpkg`, `RPM`, `APK`, `maven`, `jar`, `npm`, `unowned`, or how a crate was resolved (`cargo-auditable`, `Cargo.lock(image)`, `Cargo.lock(sdist)`)
 - `is_dependency`: Boolean indicating if this package is a dependency of another package
-- `parent_packages`: Array of package names that depend on this package
+- `parent_packages`: Packages that depend on this package; for crates, the binaries that embed them; for Java artifacts, the jars that contain them
+- `install_path`: Where the package is installed (dist-info directories, module directories, runtime paths)
+- `license_files`: License/copyright/notice files present in the image, each verified to exist and be non-empty (`<jar>!/<entry>` for files inside a jar)
+- `copyright`: Copyright holder lines from those files (and crate/npm authors)
+- `is_private_env`: `true` when every copy lives in a non-main environment (vendored `_vendor` copies, installer caches, tool-private interpreters such as Nsight Systems, backend-private wheel directories, `~/.m2`); such packages are flagged, never dropped
+- `owning_dpkg`: Debian package that installed the files, when there is one
+- `license_category`, `osrb_review_required`, `license_unmatched`: only with `--license-compliance-file`
+
+The fields from `install_path` onwards are appended after the original CSV
+columns, so positional CSV readers keep working.
+
+Image entries carry `digest`, the per-platform manifest digest, and
+`index_digest`, the manifest list digest shared by all platforms (empty for
+single-platform images).
 
 ### License Parsing
 
 The tool automatically detects and handles multiple licenses:
 
 - **Dual/Multi-licensing**: Packages licensed under multiple licenses (e.g., "MIT or Apache-2.0") are parsed and stored as "MIT | Apache-2.0"
-- **Corporate/Proprietary**: Corporate and proprietary licenses (e.g., "NVIDIA Proprietary", "Commercial License") are detected and preserved with their original names
-- **Mixed licensing**: Packages with both standard and proprietary components are properly identified (e.g., "Apache-2.0 | NVIDIA Proprietary License")
+- **Python**: `License-Expression` from the package metadata when present, then PyPI, then the metadata `License` field and classifiers
+- **Debian copyright files**: the license short names of machine-readable (DEP-5) files, with `or`/`and` written as `OR`/`AND`; otherwise licenses recognised from the text. Sentences from the copyright text are never reported as license names. Packages without a copyright file fall back to license, EULA and notice files the package itself installs.
 
 For more details, see [MULTIPLE_LICENSES.md](MULTIPLE_LICENSES.md)
 
