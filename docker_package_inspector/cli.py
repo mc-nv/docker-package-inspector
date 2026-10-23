@@ -229,6 +229,27 @@ def _truncate_license(license_text, max_length=200):
     return license_text
 
 
+# Columns appended after the original ones, so positional CSV readers keep
+# working. List values are joined with the parent_packages separator.
+EXTENDED_FIELDS = [
+    "install_path",
+    "license_files",
+    "copyright",
+    "is_private_env",
+]
+
+
+def _extended_row(package, list_separator):
+    """CSV values for EXTENDED_FIELDS of one package."""
+    row = {}
+    for field in EXTENDED_FIELDS:
+        value = package.get(field, "")
+        if isinstance(value, list):
+            value = list_separator.join(value)
+        row[field] = _sanitize_csv_value(value)
+    return row
+
+
 def _write_csv_to_file(output_data, file_handle, delimiter=","):
     """Write package data to CSV file handle.
 
@@ -251,7 +272,7 @@ def _write_csv_to_file(output_data, file_handle, delimiter=","):
         "source_code_url",
         "is_dependency",
         "parent_packages",
-    ]
+    ] + EXTENDED_FIELDS
 
     # Determine appropriate separator for parent_packages field
     parent_separator = _get_parent_packages_separator(delimiter)
@@ -289,6 +310,7 @@ def _write_csv_to_file(output_data, file_handle, delimiter=","):
                     parent_separator.join(package.get("parent_packages", []))
                 ),
             }
+            row.update(_extended_row(package, parent_separator))
             writer.writerow(row)
 
 
@@ -402,7 +424,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
         "is_dependency",
         "parent_packages",
         "inherited_from",
-    ]
+    ] + EXTENDED_FIELDS
 
     # Determine appropriate separator for parent_packages field
     parent_separator = _get_parent_packages_separator(delimiter)
@@ -441,6 +463,7 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
             ),
             "inherited_from": _sanitize_csv_value(pkg.get("inherited_from", "")),
         }
+        row.update(_extended_row(pkg, parent_separator))
         writer.writerow(row)
 
 

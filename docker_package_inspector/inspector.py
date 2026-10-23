@@ -8,6 +8,24 @@ import docker
 from docker.errors import APIError, DockerException, ImageNotFound
 
 from .package_metadata import PackageMetadataFetcher
+from .python_dists import (
+    DIST_SCAN_SCRIPT,
+    group_dists,
+    local_license,
+    local_license_fallback,
+    normalize_name,
+    parse_dist_scan,
+    project_url,
+)
+
+# Fields every package row carries, with their defaults, so JSON and CSV
+# consumers can rely on them regardless of which extractor produced the row
+PACKAGE_DEFAULTS = {
+    "install_path": list,
+    "license_files": list,
+    "copyright": list,
+    "is_private_env": lambda: False,
+}
 
 
 class DockerImageInspector:
@@ -94,11 +112,8 @@ class DockerImageInspector:
             container.start()
             self._log("Container started")
 
-            python_packages = self._extract_python_packages(container)
+            python_packages, python_deps = self._extract_python_packages(container)
             binary_packages = self._extract_binary_packages(container)
-
-            # Get Python package dependencies
-            python_deps = self._get_python_dependencies(container)
 
             # Mark packages with dependency information
             all_packages = []
@@ -118,16 +133,22 @@ class DockerImageInspector:
                 all_packages.append(pkg)
 
             # Mark Python dependencies
+            python_by_name = {
+                normalize_name(pkg["name"]): pkg
+                for pkg in all_packages
+                if pkg["package_type"] == "python"
+            }
             for pkg_name, deps in python_deps.items():
                 for dep in deps:
-                    for pkg in all_packages:
-                        if (
-                            pkg["name"].lower() == dep.lower()
-                            and pkg["package_type"] == "python"
-                        ):
-                            pkg["is_dependency"] = True
-                            if pkg_name not in pkg["parent_packages"]:
-                                pkg["parent_packages"].append(pkg_name)
+                    pkg = python_by_name.get(normalize_name(dep))
+                    if pkg is not None:
+                        pkg["is_dependency"] = True
+                        if pkg_name not in pkg["parent_packages"]:
+                            pkg["parent_packages"].append(pkg_name)
+
+            for pkg in all_packages:
+                for field, default in PACKAGE_DEFAULTS.items():
+                    pkg.setdefault(field, default())
 
             # Post-process: Check source URLs for packages with unknown licenses
             self._enrich_unknown_licenses(all_packages, container)
@@ -153,7 +174,88 @@ class DockerImageInspector:
                     self._log(f"Warning: Failed to remove container: {cleanup_error}")
 
     def _extract_python_packages(self, container):
-        """Extract Python packages from container.
+        """Extract Python packages and their dependencies from container.
+
+        Distributions are discovered from dist-info/egg-info directories, which
+        covers every installer (pip, uv, ...) and environment. pip is used only
+        as a fallback when the filesystem scan finds nothing.
+
+        Args:
+            container: Docker container object
+
+        Returns:
+            Tuple of (list of Python package dictionaries,
+            dict mapping package names to their dependencies)
+        """
+        self._log("Extracting Python packages...")
+        dists = self._scan_python_dists(container)
+        if not dists:
+            self._log("No dist-info found, falling back to pip list")
+            return (
+                self._extract_pip_packages(container),
+                self._get_python_dependencies(container),
+            )
+
+        packages = []
+        dependencies = {}
+        for group in group_dists(dists):
+            name = group["name"]
+            metadata = group["primary"]["metadata"]
+            pypi = self.metadata_fetcher.get_pypi_metadata(
+                name, metadata.get("Version", "")
+            )
+
+            license_info, license_source = local_license(metadata)
+            if not license_info:
+                license_info = pypi.get("license", "Unknown")
+                license_source = pypi.get("license_source", "PyPI API")
+            if license_info == "Unknown":
+                fallback = local_license_fallback(metadata)
+                if fallback:
+                    license_info = fallback
+                    license_source = "METADATA License/Classifier"
+
+            packages.append(
+                {
+                    "name": name,
+                    "version": group["version"],
+                    "source": pypi.get("source", f"https://pypi.org/project/{name}/"),
+                    "license": license_info,
+                    "license_source": license_source,
+                    "source_code_url": pypi.get("source_code_url")
+                    or project_url(metadata),
+                    "package_provider": group["provider"],
+                    "install_path": group["paths"],
+                    "license_files": group["license_files"],
+                    "copyright": group["copyright"],
+                    "is_private_env": group["is_private_env"],
+                }
+            )
+            if group["requires"]:
+                dependencies[name] = group["requires"]
+
+        self._log(f"Found {len(packages)} Python packages")
+        return packages, dependencies
+
+    def _scan_python_dists(self, container):
+        """Run the dist-info filesystem scan inside the container.
+
+        Returns:
+            List of parsed distributions, empty if the scan could not run
+        """
+        try:
+            exit_code, output = container.exec_run(
+                ["sh", "-c", DIST_SCAN_SCRIPT], demux=False
+            )
+            if exit_code != 0 or not output:
+                return []
+            return parse_dist_scan(output.decode("utf-8", errors="ignore"))
+        except Exception as e:
+            self._log(f"Warning: dist-info scan failed: {e}")
+            return []
+
+    def _extract_pip_packages(self, container):
+        """Extract Python packages using pip list.
 
         Args:
             container: Docker container object
@@ -161,7 +263,6 @@ class DockerImageInspector:
         Returns:
             List of Python package dictionaries
         """
-        self._log("Extracting Python packages...")
         packages = []
 
         # Try to get pip list output
@@ -588,8 +689,14 @@ class DockerImageInspector:
             license_found = None
             license_source = None
 
+            # Try license files already verified to exist in the image
+            if pkg.get("license_files"):
+                result = self._license_from_files(container, pkg["license_files"])
+                if result:
+                    license_found, license_source = result
+
             # Try to get license from installed package files (for Python packages)
-            if pkg["package_type"] == "python":
+            if not license_found and pkg["package_type"] == "python":
                 result = self._get_python_package_license(container, pkg["name"])
                 if result:
                     license_found, license_source = result
@@ -610,6 +717,37 @@ class DockerImageInspector:
 
         if enriched_count > 0:
             self._log(f"Enriched licenses for {enriched_count} packages")
+
+    def _license_from_files(self, container, license_files):
+        """Detect a license from in-image license files.
+
+        Files named like a license are tried before NOTICE/AUTHORS-style files.
+
+        Args:
+            container: Docker container object
+            license_files: Absolute paths of license-like files in the image
+
+        Returns:
+            Tuple of (license_string, license_source) or None
+        """
+        ordered = sorted(
+            license_files,
+            key=lambda path: "licen" not in path.rsplit("/", 1)[-1].lower(),
+        )
+        for path in ordered[:3]:
+            try:
+                exit_code, output = container.exec_run(["cat", path], demux=False)
+            except Exception as e:
+                self._log(f"  Warning: Failed to read {path}: {e}")
+                continue
+            if exit_code != 0 or not output:
+                continue
+            detected = self.metadata_fetcher._detect_license_from_content(
+                output.decode("utf-8", errors="ignore")[:5000]
+            )
+            if detected:
+                return detected, path
+        return None
 
     def _get_python_package_license(self, container, package_name):
         """Try to find license from Python package metadata files.
