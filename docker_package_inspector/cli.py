@@ -304,6 +304,11 @@ def _write_csv(output_data, filename, delimiter=","):
         _write_csv_to_file(output_data, f, delimiter)
 
 
+def _package_key(pkg):
+    """Identity of a package across images: its type and case-folded name."""
+    return (pkg.get("package_type", ""), pkg["name"].lower())
+
+
 def _compute_package_diff(
     result1, result2, exclusion_packages=None, exclusion_image_name=None
 ):
@@ -312,15 +317,17 @@ def _compute_package_diff(
     Args:
         result1: First image result with 'packages' list
         result2: Second image result with 'packages' list
-        exclusion_packages: Optional dict of packages to mark as inherited (keyed by name)
+        exclusion_packages: Optional dict of packages to mark as inherited
+            (keyed by _package_key)
         exclusion_image_name: Optional name of the exclusion image
 
     Returns:
         dict: Structured diff with 'added', 'removed', and 'changed' lists
     """
-    # Create dictionaries keyed by package name for easy lookup
-    packages1 = {pkg["name"]: pkg for pkg in result1.get("packages", [])}
-    packages2 = {pkg["name"]: pkg for pkg in result2.get("packages", [])}
+    # Key by type and name so same-named packages from different ecosystems
+    # (e.g. the "regex" pip package and the "regex" crate) are not merged
+    packages1 = {_package_key(pkg): pkg for pkg in result1.get("packages", [])}
+    packages2 = {_package_key(pkg): pkg for pkg in result2.get("packages", [])}
 
     exclusion_names = set(exclusion_packages.keys()) if exclusion_packages else set()
 
@@ -688,7 +695,7 @@ Examples:
                 image_name=excl_image, architecture=excl_architecture, pull=args.pull
             )
             exclusion_packages = {
-                pkg["name"]: pkg for pkg in exclusion_result.get("packages", [])
+                _package_key(pkg): pkg for pkg in exclusion_result.get("packages", [])
             }
             if args.verbose:
                 print(
