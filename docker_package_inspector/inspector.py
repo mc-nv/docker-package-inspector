@@ -2,6 +2,7 @@
 
 import io
 import json
+import re
 import signal
 import subprocess
 import sys
@@ -66,6 +67,37 @@ PACKAGE_DEFAULTS = {
 
 # DEP-5 copyright files of large packages list hundreds of holders
 MAX_COPYRIGHT_LINES = 50
+
+
+_DEP5_LICENSE_RE = re.compile(r"^License:[ \t]*(\S.*)$", re.MULTILINE)
+_DEP5_OPERATOR_RE = re.compile(r",?\s+(or|and)\s+", re.IGNORECASE)
+_DEP5_OPERAND_SPLIT_RE = re.compile(r",?\s+(?:or|and|with)\s+", re.IGNORECASE)
+_DEP5_OPERAND_RE = re.compile(r"^[^\s,;]+(\s+exception)?$", re.IGNORECASE)
+
+
+def dep5_license_names(content):
+    """License expressions named on the "License:" lines of a copyright file.
+
+    Only the first line of each License field is the license name; the
+    continuation lines are license text. DEP-5 "or"/"and" (optionally
+    preceded by a comma for precedence) become SPDX-style OR/AND. Lines
+    whose value is not made of license short names (some free-form files
+    put license text right after "License:") are ignored.
+
+    Returns:
+        De-duplicated list of expressions, in file order
+    """
+    names = []
+    for value in _DEP5_LICENSE_RE.findall(content):
+        value = value.strip(" ,.;")
+        operands = _DEP5_OPERAND_SPLIT_RE.split(value)
+        if not all(_DEP5_OPERAND_RE.match(o.strip("() ")) for o in operands):
+            continue
+        name = _DEP5_OPERATOR_RE.sub(lambda m: f" {m.group(1).upper()} ", value)
+        name = " ".join(name.split())
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def select_platform_digest(manifest, architecture, variant=""):
@@ -1248,85 +1280,23 @@ class DockerImageInspector:
         if not content:
             return "Unknown"
 
-        licenses = []
+        # Machine-readable (DEP-5) files name each license on a "License:"
+        # line; those short names are authoritative
+        names = dep5_license_names(content)
+        if names:
+            return " | ".join(names)
 
-        # First, look for explicit License: field
-        lines = content.split("\n")
-        explicit_licenses = []
-
-        for line in lines:
-            line_stripped = line.strip()
-
-            # Match "License: <name>" pattern
-            if line_stripped.startswith("License:"):
-                license_part = line_stripped.split("License:", 1)[1].strip()
-                # Extract the license name
-                license_text = license_part.split("\n")[0].strip()
-                if license_text:
-                    # Parse multiple licenses from the field
-                    parsed = self._parse_license_field(license_text)
-                    explicit_licenses.extend(parsed)
-
-        # Use the metadata fetcher's sophisticated license detection on full content
-        detected_license = self.metadata_fetcher._detect_license_from_content(content)
-
-        # Combine explicit and detected licenses
-        if explicit_licenses:
-            licenses.extend(explicit_licenses)
-        if detected_license:
-            # detected_license may already be multiple licenses joined by " | "
-            for lic in detected_license.split(" | "):
-                if lic not in licenses:
-                    licenses.append(lic)
-
-        # Also check if content contains proprietary indicators, even if standard licenses were found
-        # This handles cases like "Apache-2.0. Some components under proprietary license"
-        import re
-
-        proprietary_indicators = [
-            r"\bproprietary\b",
-            r"\bcommercial\b",
-            r"\bcorporate\b",
-        ]
-        lower_content = content.lower()
-        has_proprietary = any(
-            re.search(pattern, lower_content) for pattern in proprietary_indicators
-        )
-
-        if has_proprietary:
-            # Try to extract just the proprietary part
-            # Look for sentences or phrases containing proprietary indicators
-            sentences = re.split(r"[.!]\s+", content)
-            for sentence in sentences:
-                sentence_lower = sentence.lower()
-                if any(
-                    re.search(pattern, sentence_lower)
-                    for pattern in proprietary_indicators
-                ):
-                    # This sentence contains proprietary info
-                    # Parse it to extract the license
-                    parsed = self._parse_license_field(sentence)
-                    for lic in parsed:
-                        # Check if this looks like a proprietary license (not a standard one)
-                        # and not already in licenses
-                        if lic not in licenses and any(
-                            re.search(pattern, lic.lower())
-                            for pattern in proprietary_indicators
-                        ):
-                            licenses.append(lic)
-
-        # If no licenses found yet, try to parse the entire content as a license field
-        # This handles cases like proprietary licenses that don't match standard patterns
-        if not licenses:
-            parsed = self._parse_license_field(content)
-            if parsed:
-                licenses.extend(parsed)
-
-        if licenses:
-            # DEP-5 files repeat the same License: stanza per Files: block
-            return " | ".join(dict.fromkeys(licenses))
-
-        return "Unknown"
+        # Free-form files: only licenses recognised from their text. Prose is
+        # never returned as a license name; the file itself is listed in
+        # license_files for review.
+        detected = self.metadata_fetcher._detect_license_from_content(content)
+        if not detected:
+            return "Unknown"
+        if _DEP5_LICENSE_RE.search(content):
+            # License fields hold text that was not identified, so the
+            # detected list may be incomplete: keep the package unresolved
+            return f"{detected} | Unknown"
+        return detected
 
     def _parse_license_field(self, license_text):
         """Parse a license field that may contain multiple licenses.
