@@ -564,6 +564,8 @@ class PackageMetadataFetcher:
             (r"\bmpl\s+2\b", "MPL-2.0"),
             # ISC patterns
             (r"isc license", "ISC"),
+            # Python Software Foundation License (CPython's LICENSE.txt)
+            (r"python software foundation license version 2", "PSF-2.0"),
             (r"\bisc\b(?!\s*(?:license|$))", "ISC"),  # Match standalone "ISC"
         ]
 

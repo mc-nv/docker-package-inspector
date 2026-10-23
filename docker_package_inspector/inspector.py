@@ -31,6 +31,12 @@ from .python_dists import (
     parse_dist_scan,
     project_url,
 )
+from .runtimes import (
+    RUNTIME_SCAN_SCRIPT,
+    RUNTIME_SOURCES,
+    parse_runtime_scan,
+    python_license_candidates,
+)
 from .rust_crates import (
     CARGO_FILES_SCRIPT,
     RECORD_LOOKUP_SCRIPT,
@@ -181,6 +187,9 @@ class DockerImageInspector:
                         if pkg_name not in pkg["parent_packages"]:
                             pkg["parent_packages"].append(pkg_name)
 
+            all_packages.extend(
+                self._extract_unowned_runtimes(container, python_packages)
+            )
             all_packages.extend(self._extract_java_packages(container))
             all_packages.extend(self._extract_npm_packages(container))
 
@@ -339,7 +348,9 @@ class DockerImageInspector:
             return []
         self._log(f"Found {len(hosts)} Rust binaries")
 
-        host_owner = self._rust_host_owners(container, hosts, python_packages)
+        host_owner = self._record_owners(
+            container, [path for path, _ in hosts], python_packages
+        )
         cargo_files = split_files(self._exec_text(container, CARGO_FILES_SCRIPT))
 
         crates = {}
@@ -387,16 +398,19 @@ class DockerImageInspector:
         )
         return sorted(crates.values(), key=lambda c: c["name"]) + unresolved
 
-    def _rust_host_owners(self, container, hosts, python_packages):
-        """Map Rust binary paths to the Python package that installed them."""
+    def _record_owners(self, container, paths, python_packages):
+        """Map file paths to the Python package whose RECORD lists them.
+
+        Returns:
+            Dict of path -> {"name", "version"} of the installing wheel
+        """
         dist_to_pkg = {}
         for pkg in python_packages:
             for dist_path in pkg.get("install_path", []):
                 if dist_path.endswith(".dist-info"):
                     dist_to_pkg[dist_path] = pkg
-        if not dist_to_pkg:
+        if not dist_to_pkg or not paths:
             return {}
-        paths = [path for path, _ in hosts]
         output = self._exec_text(
             container,
             RECORD_LOOKUP_SCRIPT,
@@ -408,6 +422,72 @@ class DockerImageInspector:
             version = dist_info_version(dist_info) or pkg["version"].split(", ")[0]
             owners[host] = {"name": pkg["name"], "version": version}
         return owners
+
+    def _extract_unowned_runtimes(self, container, python_packages):
+        """Report OpenSSL and Python runtimes that no Debian package installed.
+
+        Copies bundled in a wheel name that wheel in parent_packages. The
+        license is taken only from a license file found next to the runtime;
+        otherwise it stays Unknown.
+
+        Returns:
+            List of package dictionaries (package_provider "unowned")
+        """
+        self._log("Looking for unowned OpenSSL/Python runtimes...")
+        runtimes = parse_runtime_scan(self._exec_text(container, RUNTIME_SCAN_SCRIPT))
+        owned = self._dpkg_owners(container, [r["path"] for r in runtimes])
+        runtimes = [r for r in runtimes if r["path"] not in owned]
+        if not runtimes:
+            return []
+        wheel_owners = self._record_owners(
+            container, [r["path"] for r in runtimes], python_packages
+        )
+
+        rows = {}
+        for runtime in runtimes:
+            license_files = []
+            if runtime["kind"] == "python":
+                candidates = python_license_candidates(runtime)
+                license_files = self._exec_text(
+                    container,
+                    'for f; do [ -f "$f" ] && [ -s "$f" ] && printf "%s\\n" "$f"; done',
+                    *candidates,
+                ).splitlines()
+
+            row = rows.get(runtime["kind"])
+            if row is None:
+                row = rows[runtime["kind"]] = {
+                    "name": runtime["kind"],
+                    "version": runtime["version"],
+                    "source": RUNTIME_SOURCES.get(runtime["kind"], ""),
+                    "license": "Unknown",
+                    "license_source": "No license file next to the runtime",
+                    "source_code_url": RUNTIME_SOURCES.get(runtime["kind"], ""),
+                    "package_provider": "unowned",
+                    "package_type": "binary",
+                    "is_dependency": False,
+                    "parent_packages": [],
+                    "install_path": [],
+                    "license_files": [],
+                }
+            versions = [v for v in row["version"].split(", ") if v]
+            if runtime["version"] and runtime["version"] not in versions:
+                row["version"] = ", ".join(sorted(versions + [runtime["version"]]))
+            row["install_path"].append(runtime["path"])
+            owner = wheel_owners.get(runtime["path"])
+            if owner and owner["name"] not in row["parent_packages"]:
+                row["parent_packages"].append(owner["name"])
+            for path in license_files:
+                if path not in row["license_files"]:
+                    row["license_files"].append(path)
+
+        for row in rows.values():
+            if row["license_files"]:
+                result = self._license_from_files(container, row["license_files"])
+                if result:
+                    row["license"], row["license_source"] = result
+        self._log(f"Found {len(rows)} unowned runtimes")
+        return list(rows.values())
 
     def _auditable_crates(self, container, path):
         """Runtime crates recorded by cargo-auditable in a binary, or None."""
