@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from . import __version__
 from .inspector import DockerImageInspector
+from .license_compliance import COMPLIANCE_FIELDS, LicensePolicy, LicensePolicyError
 
 
 def _signal_handler(signum, frame):
@@ -240,10 +241,10 @@ EXTENDED_FIELDS = [
 ]
 
 
-def _extended_row(package, list_separator):
-    """CSV values for EXTENDED_FIELDS of one package."""
+def _extended_row(package, list_separator, fields=EXTENDED_FIELDS):
+    """CSV values for the given appended fields of one package."""
     row = {}
-    for field in EXTENDED_FIELDS:
+    for field in fields:
         value = package.get(field, "")
         if isinstance(value, list):
             value = list_separator.join(value)
@@ -251,7 +252,17 @@ def _extended_row(package, list_separator):
     return row
 
 
-def _write_csv_to_file(output_data, file_handle, delimiter=","):
+def _added_by_category(diff_result):
+    """Count packages ADDED (not inherited) in a diff per license category."""
+    counts = {}
+    for pkg in diff_result["added"]:
+        if pkg.get("change_type") == "ADDED":
+            category = pkg.get("license_category", "unknown")
+            counts[category] = counts.get(category, 0) + 1
+    return counts
+
+
+def _write_csv_to_file(output_data, file_handle, delimiter=",", extra_fields=()):
     """Write package data to CSV file handle.
 
     Args:
@@ -259,21 +270,25 @@ def _write_csv_to_file(output_data, file_handle, delimiter=","):
         file_handle: File handle to write to
         delimiter: CSV column delimiter (default: ",")
     """
-    fieldnames = [
-        "image",
-        "digest",
-        "architecture",
-        "name",
-        "version",
-        "package_type",
-        "package_provider",
-        "source",
-        "license",
-        "license_source",
-        "source_code_url",
-        "is_dependency",
-        "parent_packages",
-    ] + EXTENDED_FIELDS
+    fieldnames = (
+        [
+            "image",
+            "digest",
+            "architecture",
+            "name",
+            "version",
+            "package_type",
+            "package_provider",
+            "source",
+            "license",
+            "license_source",
+            "source_code_url",
+            "is_dependency",
+            "parent_packages",
+        ]
+        + EXTENDED_FIELDS
+        + list(extra_fields)
+    )
 
     # Determine appropriate separator for parent_packages field
     parent_separator = _get_parent_packages_separator(delimiter)
@@ -311,11 +326,15 @@ def _write_csv_to_file(output_data, file_handle, delimiter=","):
                     parent_separator.join(package.get("parent_packages", []))
                 ),
             }
-            row.update(_extended_row(package, parent_separator))
+            row.update(
+                _extended_row(
+                    package, parent_separator, EXTENDED_FIELDS + list(extra_fields)
+                )
+            )
             writer.writerow(row)
 
 
-def _write_csv(output_data, filename, delimiter=","):
+def _write_csv(output_data, filename, delimiter=",", extra_fields=()):
     """Write package data to CSV file.
 
     Args:
@@ -324,7 +343,7 @@ def _write_csv(output_data, filename, delimiter=","):
         delimiter: CSV column delimiter (default: ",")
     """
     with open(filename, "w", encoding="utf-8", newline="") as f:
-        _write_csv_to_file(output_data, f, delimiter)
+        _write_csv_to_file(output_data, f, delimiter, extra_fields)
 
 
 def _package_key(pkg):
@@ -402,7 +421,7 @@ def _compute_package_diff(
     }
 
 
-def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
+def _write_diff_csv_to_file(diff_data, file_handle, delimiter=",", extra_fields=()):
     """Write diff data to CSV file handle.
 
     Args:
@@ -411,21 +430,25 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
         delimiter: CSV column delimiter (default: ",")
     """
     # Use same fieldnames as regular output, but add change_type, version_from, and inherited_from
-    fieldnames = [
-        "change_type",
-        "name",
-        "version",
-        "version_from",
-        "package_type",
-        "package_provider",
-        "source",
-        "license",
-        "license_source",
-        "source_code_url",
-        "is_dependency",
-        "parent_packages",
-        "inherited_from",
-    ] + EXTENDED_FIELDS
+    fieldnames = (
+        [
+            "change_type",
+            "name",
+            "version",
+            "version_from",
+            "package_type",
+            "package_provider",
+            "source",
+            "license",
+            "license_source",
+            "source_code_url",
+            "is_dependency",
+            "parent_packages",
+            "inherited_from",
+        ]
+        + EXTENDED_FIELDS
+        + list(extra_fields)
+    )
 
     # Determine appropriate separator for parent_packages field
     parent_separator = _get_parent_packages_separator(delimiter)
@@ -464,11 +487,13 @@ def _write_diff_csv_to_file(diff_data, file_handle, delimiter=","):
             ),
             "inherited_from": _sanitize_csv_value(pkg.get("inherited_from", "")),
         }
-        row.update(_extended_row(pkg, parent_separator))
+        row.update(
+            _extended_row(pkg, parent_separator, EXTENDED_FIELDS + list(extra_fields))
+        )
         writer.writerow(row)
 
 
-def _write_diff_csv(diff_data, filename, delimiter=","):
+def _write_diff_csv(diff_data, filename, delimiter=",", extra_fields=()):
     """Write diff data to CSV file.
 
     Args:
@@ -477,7 +502,7 @@ def _write_diff_csv(diff_data, filename, delimiter=","):
         delimiter: CSV column delimiter (default: ",")
     """
     with open(filename, "w", encoding="utf-8", newline="") as f:
-        _write_diff_csv_to_file(diff_data, f, delimiter)
+        _write_diff_csv_to_file(diff_data, f, delimiter, extra_fields)
 
 
 def main():
@@ -583,6 +608,14 @@ Examples:
     )
 
     parser.add_argument(
+        "--license-compliance-file",
+        metavar="PATH",
+        help="License policy JSON (category -> list of license names) to "
+        "classify every package license against; adds license_category, "
+        "osrb_review_required and license_unmatched to the output",
+    )
+
+    parser.add_argument(
         "--skip-rust-scan",
         action="store_true",
         help="Do not search binaries for statically linked Rust crates "
@@ -649,6 +682,24 @@ Examples:
         # Validate --exclude-packages-from-image requirements
         if args.exclude_packages_from_image and not args.diff:
             parser.error("--exclude-packages-from-image requires --diff mode")
+
+        # Load the license policy before any (slow) image inspection, so an
+        # unreadable or malformed file fails immediately
+        policy = None
+        compliance_fields = ()
+        if args.license_compliance_file:
+            try:
+                policy = LicensePolicy.from_file(args.license_compliance_file)
+            except LicensePolicyError as e:
+                parser.error(f"--license-compliance-file: {e}")
+            compliance_fields = COMPLIANCE_FIELDS
+            if args.verbose:
+                print(
+                    f"Loaded license policy: {len(policy.index)} license names, "
+                    f"{policy.conflicts} listed in more than one category "
+                    "(most restrictive kept)",
+                    file=sys.stderr,
+                )
 
         inspector = DockerImageInspector(
             verbose=args.verbose, scan_rust=not args.skip_rust_scan
@@ -737,6 +788,11 @@ Examples:
                     file=sys.stderr,
                 )
 
+        if policy is not None:
+            for result in results:
+                for pkg in result["packages"]:
+                    pkg.update(policy.evaluate(pkg.get("license", "")))
+
         # Create output data
         if args.diff:
             # Diff mode - compare the two images
@@ -775,6 +831,11 @@ Examples:
                 },
                 "differences": diff_result,
             }
+
+            if policy is not None:
+                output_data["summary"][
+                    "added_by_license_category"
+                ] = _added_by_category(diff_result)
 
             # Add exclusion image info if provided
             if exclusion_image_name:
@@ -833,10 +894,15 @@ Examples:
         if csv_output_file:
             if args.diff:
                 _write_diff_csv(
-                    output_data["differences"], csv_output_file, args.delimiter
+                    output_data["differences"],
+                    csv_output_file,
+                    args.delimiter,
+                    compliance_fields,
                 )
             else:
-                _write_csv(output_data, csv_output_file, args.delimiter)
+                _write_csv(
+                    output_data, csv_output_file, args.delimiter, compliance_fields
+                )
             if args.verbose or not args.csv_output:
                 print(f"CSV output written to: {csv_output_file}", file=sys.stderr)
 
