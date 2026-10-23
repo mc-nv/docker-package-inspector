@@ -691,6 +691,7 @@ Examples:
                     {
                         "image": image_name,
                         "digest": result.get("digest", ""),
+                        "index_digest": result.get("index_digest", ""),
                         "architecture": result.get("architecture", "unknown"),
                         "packages": result.get("packages", []),
                     }
@@ -753,12 +754,14 @@ Examples:
                 "image_from": {
                     "name": results[0]["image"],
                     "digest": results[0]["digest"],
+                    "index_digest": results[0]["index_digest"],
                     "architecture": results[0]["architecture"],
                     "total_packages": len(results[0]["packages"]),
                 },
                 "image_to": {
                     "name": results[1]["image"],
                     "digest": results[1]["digest"],
+                    "index_digest": results[1]["index_digest"],
                     "architecture": results[1]["architecture"],
                     "total_packages": len(results[1]["packages"]),
                 },

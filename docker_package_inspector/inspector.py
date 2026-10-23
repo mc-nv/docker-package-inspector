@@ -3,6 +3,7 @@
 import io
 import json
 import signal
+import subprocess
 import sys
 import tarfile
 
@@ -67,6 +68,33 @@ PACKAGE_DEFAULTS = {
 MAX_COPYRIGHT_LINES = 50
 
 
+def select_platform_digest(manifest, architecture, variant=""):
+    """Pick the manifest digest for a platform from a manifest list / index.
+
+    Args:
+        manifest: Parsed `docker manifest inspect` output
+        architecture: Wanted architecture (e.g. amd64, arm64)
+        variant: Wanted variant (e.g. v8); ignored when the entry has none
+
+    Returns:
+        The digest, "" if the index has no matching linux entry, or None if
+        the manifest is not an index
+    """
+    entries = manifest.get("manifests")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        platform = entry.get("platform") or {}
+        if platform.get("os") != "linux":
+            continue
+        if platform.get("architecture") != architecture:
+            continue
+        if variant and platform.get("variant") and platform["variant"] != variant:
+            continue
+        return entry.get("digest", "")
+    return ""
+
+
 class DockerImageInspector:
     """Inspects Docker images and extracts package information."""
 
@@ -111,11 +139,13 @@ class DockerImageInspector:
         client = self._get_docker_client()
 
         # Pull image if requested
+        pulled = False
         if pull:
             self._log(f"Pulling image: {image_name}")
             try:
                 platform = f"linux/{architecture}" if architecture else None
                 client.images.pull(image_name, platform=platform)
+                pulled = True
                 self._log("Image pulled successfully")
             except Exception as e:
                 self._log(f"Warning: Failed to pull image: {e}")
@@ -129,6 +159,7 @@ class DockerImageInspector:
         # Get image architecture and digest
         image_arch = image.attrs.get("Architecture", "unknown")
         image_digest = ""
+        index_digest = ""
         if image.attrs.get("RepoDigests"):
             full_digest = (
                 image.attrs["RepoDigests"][0] if image.attrs["RepoDigests"] else ""
@@ -138,8 +169,21 @@ class DockerImageInspector:
                 image_digest = full_digest.split("@", 1)[1]
             else:
                 image_digest = full_digest
+            image_digest, index_digest = self._platform_digest(
+                full_digest, image_digest, image_arch, image.attrs.get("Variant", "")
+            )
+        elif pulled:
+            # The classic image store records RepoDigests for only one
+            # platform per tag, so a second architecture pulled under the
+            # same tag has none: resolve it from the tag just pulled
+            self._log("No RepoDigests for this platform, resolving by tag")
+            image_digest, _ = self._platform_digest(
+                image_name, "", image_arch, image.attrs.get("Variant", "")
+            )
         self._log(f"Image architecture: {image_arch}")
         self._log(f"Image digest: {image_digest}")
+        if index_digest:
+            self._log(f"Image index digest: {index_digest}")
 
         # Create and run container
         self._log("Creating temporary container...")
@@ -209,6 +253,7 @@ class DockerImageInspector:
 
             return {
                 "digest": image_digest,
+                "index_digest": index_digest,
                 "architecture": image_arch,
                 "packages": all_packages,
             }
@@ -226,6 +271,63 @@ class DockerImageInspector:
                     self._log("Temporary container removed")
                 except Exception as cleanup_error:
                     self._log(f"Warning: Failed to remove container: {cleanup_error}")
+
+    def _platform_digest(self, repo_digest_ref, repo_digest, architecture, variant):
+        """Resolve the per-platform manifest digest of a pulled image.
+
+        RepoDigests holds the digest the image was pulled by, which for a
+        multi-arch image is the index (manifest list) digest, identical for
+        every architecture. The index is inspected by that exact digest (not
+        the tag, which may have moved since the pull) and the entry for the
+        inspected platform is selected.
+
+        Args:
+            repo_digest_ref: "<repository>@<digest>" from RepoDigests, or the
+                pulled tag when the image has no RepoDigests
+            repo_digest: The digest part of repo_digest_ref ("" for a tag)
+            architecture: Architecture of the pulled image (e.g. arm64)
+            variant: Architecture variant of the pulled image (e.g. v8)
+
+        Returns:
+            Tuple of (platform digest, index digest). The index digest is ""
+            for a single-platform image. On any failure the repo digest is
+            returned unchanged with an empty index digest.
+        """
+        if not repo_digest_ref:
+            return repo_digest, ""
+        try:
+            result = subprocess.run(
+                ["docker", "manifest", "inspect", repo_digest_ref],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            self._log(f"Warning: docker manifest inspect unavailable: {e}")
+            return repo_digest, ""
+        if result.returncode != 0:
+            self._log(
+                "Warning: docker manifest inspect failed, digest may be the "
+                f"index digest: {result.stderr.strip()}"
+            )
+            return repo_digest, ""
+        try:
+            manifest = json.loads(result.stdout)
+        except ValueError:
+            self._log("Warning: unreadable docker manifest inspect output")
+            return repo_digest, ""
+
+        platform_digest = select_platform_digest(manifest, architecture, variant)
+        if platform_digest is None:
+            # Not an index: the pulled digest already is the platform manifest
+            return repo_digest, ""
+        if not platform_digest:
+            self._log(
+                f"Warning: no {architecture} entry in index {repo_digest}, "
+                "keeping the index digest"
+            )
+            return repo_digest, ""
+        return platform_digest, repo_digest
 
     def _extract_python_packages(self, container):
         """Extract Python packages and their dependencies from container.
