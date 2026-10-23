@@ -1,6 +1,10 @@
 """Tests for dpkg license handling and Debian Python ownership."""
 
-from docker_package_inspector.inspector import DockerImageInspector, dep5_license_names
+from docker_package_inspector.inspector import (
+    DockerImageInspector,
+    dep5_license_names,
+    license_title,
+)
 
 
 class FakeContainer:
@@ -206,3 +210,49 @@ def test_non_usr_lib_dists_are_not_queried():
     container = FakeContainer([])
     DockerImageInspector()._link_python_to_dpkg(container, [pkg])
     assert container.calls == []
+
+
+DCGM_COPYRIGHT = """                 NVIDIA DATA CENTER GPU MANAGER LICENSE
+
+This license is a legal agreement between you and NVIDIA Corporation ("NVIDIA")
+and governs your use of the NVIDIA Data Center GPU Manager (DCGM) software and
+materials provided hereunder ("SOFTWARE").
+
+2. LIMITATIONS
+a. You may not reverse engineer, decompile or disassemble, or remove copyright
+or other proprietary notices from any portion of the SOFTWARE.
+"""
+
+
+def test_license_title():
+    assert license_title(DCGM_COPYRIGHT) == "NVIDIA DATA CENTER GPU MANAGER LICENSE"
+    assert license_title("\n\nEnd User License Agreement\n\nText") == (
+        "End User License Agreement"
+    )
+    # Sentences, copyright lines and non-license headings are not titles
+    assert license_title("This license is a legal agreement between you and us.") == ""
+    assert license_title("Copyright 2020 NVIDIA Corporation\nLicense text") == ""
+    assert license_title("README\n\nNVIDIA LICENSE") == ""
+    assert license_title("") == ""
+
+
+def test_proprietary_copyright_file_is_named_by_its_title():
+    container = FakeContainer(
+        [("cat /usr/share/doc/libdcgm/copyright", (0, DCGM_COPYRIGHT.encode()))]
+    )
+    license_info, source, files, _ = DockerImageInspector()._get_dpkg_license(
+        container, "libdcgm"
+    )
+    assert license_info == "NVIDIA DATA CENTER GPU MANAGER LICENSE"
+    assert source == "/usr/share/doc/libdcgm/copyright"
+
+
+def test_owned_eula_without_known_license_is_named_by_its_title():
+    eula = "/opt/nvidia/nsight-systems/EULA.txt"
+    container = FakeContainer(
+        [(f"cat {eula}", (0, b"NVIDIA SOFTWARE LICENSE AGREEMENT\n\nTerms..."))]
+    )
+    assert DockerImageInspector()._license_from_files(container, [eula]) == (
+        "NVIDIA SOFTWARE LICENSE AGREEMENT",
+        f"{eula} (title)",
+    )

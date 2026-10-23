@@ -100,6 +100,40 @@ def dep5_license_names(content):
     return names
 
 
+_TITLE_KEYWORD_RE = re.compile(r"\b(licen[cs]e|eula|agreement)\b", re.IGNORECASE)
+
+
+def license_title(content):
+    """The title of a license document, if it opens with one.
+
+    Proprietary licenses (e.g. "NVIDIA DATA CENTER GPU MANAGER LICENSE") match
+    none of the known open source texts, but name themselves in a heading.
+    The first non-empty line is used when it reads as a heading: it mentions
+    a license/EULA/agreement, is short, and is upper case or a short
+    capitalised phrase not ending like a sentence.
+
+    Returns:
+        The title with whitespace collapsed, or "" if there is none
+    """
+    for line in content.splitlines():
+        line = " ".join(line.split())
+        if line:
+            break
+    else:
+        return ""
+    if len(line) > 100 or not _TITLE_KEYWORD_RE.search(line):
+        return ""
+    letters = [c for c in line if c.isalpha()]
+    upper = sum(c.isupper() for c in letters) >= 0.8 * len(letters)
+    words = [w for w in line.split() if w[0].isalpha()]
+    capitalised = (
+        len(line.split()) <= 8
+        and not line.endswith((".", ",", ";", ":"))
+        and sum(w[0].isupper() for w in words) >= 0.6 * len(words)
+    )
+    return line if upper or capitalised else ""
+
+
 def select_platform_digest(manifest, architecture, variant=""):
     """Pick the manifest digest for a platform from a manifest list / index.
 
@@ -1291,7 +1325,9 @@ class DockerImageInspector:
         # license_files for review.
         detected = self.metadata_fetcher._detect_license_from_content(content)
         if not detected:
-            return "Unknown"
+            # Proprietary licenses shipped as the copyright file are named by
+            # their own heading
+            return license_title(content) or "Unknown"
         if _DEP5_LICENSE_RE.search(content):
             # License fields hold text that was not identified, so the
             # detected list may be incomplete: keep the package unresolved
@@ -1455,6 +1491,8 @@ class DockerImageInspector:
         """Detect a license from in-image license files.
 
         Files named like a license are tried before NOTICE/AUTHORS-style files.
+        When none of them contains a known open source license, the heading
+        of a license file is used (proprietary EULAs name themselves).
 
         Args:
             container: Docker container object
@@ -1463,10 +1501,13 @@ class DockerImageInspector:
         Returns:
             Tuple of (license_string, license_source) or None
         """
-        ordered = sorted(
-            license_files,
-            key=lambda path: "licen" not in path.rsplit("/", 1)[-1].lower(),
-        )
+
+        def is_license_named(path):
+            name = path.rsplit("/", 1)[-1].lower()
+            return "licen" in name or "eula" in name
+
+        ordered = sorted(license_files, key=lambda path: not is_license_named(path))
+        contents = []
         for path in ordered[:3]:
             try:
                 exit_code, output = container.exec_run(["cat", path], demux=False)
@@ -1475,11 +1516,16 @@ class DockerImageInspector:
                 continue
             if exit_code != 0 or not output:
                 continue
-            detected = self.metadata_fetcher._detect_license_from_content(
-                output.decode("utf-8", errors="ignore")[:5000]
-            )
+            content = output.decode("utf-8", errors="ignore")[:5000]
+            detected = self.metadata_fetcher._detect_license_from_content(content)
             if detected:
                 return detected, path
+            contents.append((path, content))
+        for path, content in contents:
+            if is_license_named(path):
+                title = license_title(content)
+                if title:
+                    return title, f"{path} (title)"
         return None
 
     def _get_python_package_license(self, container, package_name):
