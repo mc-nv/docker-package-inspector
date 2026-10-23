@@ -56,6 +56,14 @@ class PackageMetadataFetcher:
         except Exception:
             return None
 
+    def get_maven_pom(self, url: str) -> str:
+        """Text of a POM from Maven Central (cached), or '' if unavailable."""
+        cache_key = f"pom:{url}"
+        if cache_key not in self.cache:
+            body = self.fetch_bytes(url, max_bytes=4 * 1024 * 1024)
+            self.cache[cache_key] = body.decode("utf-8", "replace") if body else ""
+        return self.cache[cache_key]
+
     def get_pypi_sdist_url(self, package_name: str, version: str) -> Optional[str]:
         """URL of the source distribution of an exact PyPI release, if any."""
         cache_key = f"sdist:{package_name}:{version}"

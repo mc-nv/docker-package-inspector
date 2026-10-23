@@ -9,6 +9,16 @@ import tarfile
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound
 
+from .java_npm import (
+    JAR_SCAN_SCRIPT,
+    NPM_SCAN_SCRIPT,
+    jar_display_name,
+    maven_coordinates_from_m2_path,
+    maven_pom_url,
+    parse_jar,
+    parse_npm_scan,
+    parse_pom,
+)
 from .package_metadata import PackageMetadataFetcher
 from .python_dists import (
     DIST_SCAN_SCRIPT,
@@ -170,6 +180,9 @@ class DockerImageInspector:
                         pkg["is_dependency"] = True
                         if pkg_name not in pkg["parent_packages"]:
                             pkg["parent_packages"].append(pkg_name)
+
+            all_packages.extend(self._extract_java_packages(container))
+            all_packages.extend(self._extract_npm_packages(container))
 
             if self.scan_rust:
                 all_packages.extend(
@@ -486,6 +499,226 @@ class DockerImageInspector:
             "parent_packages": [owner["name"]] if owner else [],
             "install_path": [path],
         }
+
+    def _dpkg_owners(self, container, paths):
+        """Map paths to the Debian package that installed them (one call)."""
+        paths = [p for p in paths if p.startswith("/usr/") or p.startswith("/opt/")]
+        if not paths:
+            return {}
+        try:
+            _, output = container.exec_run(["dpkg-query", "-S"] + paths, demux=False)
+        except Exception as e:
+            self._log(f"Warning: dpkg ownership lookup failed: {e}")
+            return {}
+        owners = {}
+        for line in (output or b"").decode("utf-8", errors="ignore").splitlines():
+            if line.startswith("diversion by "):
+                continue
+            names, sep, path = line.partition(": ")
+            if sep and path.strip() in paths:
+                owners[path.strip()] = names.split(",")[0].strip().split(":")[0]
+        return owners
+
+    def _extract_java_packages(self, container):
+        """Extract Maven artifacts from the jar files in the container.
+
+        Every artifact bundled in a jar (including shaded jar-with-dependencies
+        builds) becomes a "java" row whose parent_packages names the jar. A
+        jar's META-INF license files are credited to its artifact only when
+        the jar holds a single artifact: in a shaded jar they belong to one
+        of the bundled projects and say nothing about the others.
+
+        Returns:
+            List of package dictionaries
+        """
+        self._log("Extracting Java packages...")
+        jar_paths = self._exec_text(container, JAR_SCAN_SCRIPT).splitlines()
+        if not jar_paths:
+            return []
+        owners = self._dpkg_owners(container, jar_paths)
+
+        rows = {}
+        for path in jar_paths:
+            coordinates = maven_coordinates_from_m2_path(path)
+            if coordinates:
+                group, artifact, version = coordinates
+                pom_path = path.rsplit("/", 1)[0] + f"/{artifact}-{version}.pom"
+                pom = self._exec_text(container, 'cat "$1"', pom_path)
+                jar = {
+                    "artifacts": [
+                        {
+                            "group": group,
+                            "artifact": artifact,
+                            "version": version,
+                            "pom": pom,
+                        }
+                    ],
+                    "license_entries": [],
+                    "copyright": [],
+                }
+            else:
+                data = self._read_container_file(container, path)
+                try:
+                    jar = parse_jar(data) if data else None
+                except Exception as e:
+                    self._log(f"  Warning: Failed to read jar {path}: {e}")
+                    jar = None
+                if jar is None:
+                    continue
+                if not jar["artifacts"]:
+                    manifest = jar["manifest"]
+                    jar["artifacts"] = [
+                        {
+                            "group": "",
+                            "artifact": manifest.get("title") or jar_display_name(path),
+                            "version": manifest.get("version", ""),
+                            "pom": "",
+                            "manifest_license": manifest.get("license", ""),
+                        }
+                    ]
+
+            single = len(jar["artifacts"]) == 1
+            for art in jar["artifacts"]:
+                self._add_java_row(
+                    rows,
+                    art,
+                    path,
+                    license_files=(
+                        [f"{path}!/{entry}" for entry in jar["license_entries"]]
+                        if single
+                        else []
+                    ),
+                    copyright_lines=jar["copyright"] if single else [],
+                    private=coordinates is not None,
+                    owner=owners.get(path, ""),
+                )
+
+        self._log(f"Found {len(rows)} Java artifacts in {len(jar_paths)} jars")
+        return sorted(rows.values(), key=lambda r: r["name"])
+
+    def _add_java_row(
+        self, rows, art, jar_path, license_files, copyright_lines, private, owner
+    ):
+        """Merge one artifact occurrence into the per-artifact Java rows."""
+        name = f"{art['group']}:{art['artifact']}" if art["group"] else art["artifact"]
+        row = rows.get(name)
+        if row is None:
+            licenses, source, url = self._maven_license(art)
+            row = rows[name] = {
+                "name": name,
+                "version": art["version"],
+                "source": (
+                    f"https://central.sonatype.com/artifact/{art['group']}/"
+                    f"{art['artifact']}/{art['version']}"
+                    if art["group"]
+                    else ""
+                ),
+                "license": " | ".join(licenses) if licenses else "Unknown",
+                "license_source": source,
+                "source_code_url": url,
+                "package_provider": "maven" if art["group"] else "jar",
+                "package_type": "java",
+                "is_dependency": False,
+                "parent_packages": [],
+                "license_files": [],
+                "copyright": [],
+                "is_private_env": private,
+                "owning_dpkg": owner,
+            }
+        elif art["version"] not in row["version"].split(", "):
+            row["version"] = ", ".join(
+                sorted(row["version"].split(", ") + [art["version"]])
+            )
+        row["is_private_env"] = row["is_private_env"] and private
+        row["owning_dpkg"] = row["owning_dpkg"] or owner
+        if jar_path not in row["parent_packages"]:
+            row["parent_packages"].append(jar_path)
+        for field, values in (
+            ("license_files", license_files),
+            ("copyright", copyright_lines),
+        ):
+            for value in values:
+                if value not in row[field]:
+                    row[field].append(value)
+
+    def _maven_license(self, art, max_parents=2):
+        """Licenses declared for an artifact, following parent POMs.
+
+        Returns:
+            Tuple of (license names, license_source, SCM URL)
+        """
+        if not art["group"]:
+            if art.get("manifest_license"):
+                return [art["manifest_license"]], "MANIFEST.MF Bundle-License", ""
+            return [], "No Maven metadata", ""
+        pom_text = art["pom"]
+        source = "embedded pom.xml"
+        if not pom_text:
+            pom_text = self.metadata_fetcher.get_maven_pom(
+                maven_pom_url(art["group"], art["artifact"], art["version"])
+            )
+            source = "Maven Central pom"
+        pom = parse_pom(pom_text)
+        url = pom["url"]
+        for _ in range(max_parents):
+            if pom["licenses"] or not pom["parent"]:
+                break
+            parent = pom["parent"]
+            pom = parse_pom(self.metadata_fetcher.get_maven_pom(maven_pom_url(*parent)))
+            source = f"parent pom {':'.join(parent)}"
+            url = url or pom["url"]
+        if pom["licenses"]:
+            return pom["licenses"], source, url
+        return [], "Not declared in pom", url
+
+    def _extract_npm_packages(self, container):
+        """Extract npm packages installed under node_modules directories.
+
+        Returns:
+            List of package dictionaries
+        """
+        self._log("Extracting npm packages...")
+        found = parse_npm_scan(self._exec_text(container, NPM_SCAN_SCRIPT))
+        if not found:
+            return []
+        owners = self._dpkg_owners(container, [p["directory"] for p in found])
+
+        rows = {}
+        for pkg in found:
+            row = rows.get(pkg["name"])
+            if row is None:
+                row = rows[pkg["name"]] = {
+                    "name": pkg["name"],
+                    "version": pkg["version"],
+                    "source": f"https://www.npmjs.com/package/{pkg['name']}"
+                    f"/v/{pkg['version']}",
+                    "license": pkg["license"] or "Unknown",
+                    "license_source": "package.json"
+                    if pkg["license"]
+                    else "Not declared",
+                    "source_code_url": pkg["repository"],
+                    "package_provider": "npm",
+                    "package_type": "npm",
+                    "is_dependency": pkg["is_module"],
+                    "parent_packages": [],
+                    "install_path": [],
+                    "license_files": [],
+                    "copyright": [],
+                    "owning_dpkg": owners.get(pkg["directory"], ""),
+                }
+            else:
+                versions = row["version"].split(", ")
+                if pkg["version"] not in versions:
+                    row["version"] = ", ".join(sorted(versions + [pkg["version"]]))
+                row["is_dependency"] = row["is_dependency"] and pkg["is_module"]
+            row["install_path"].append(pkg["directory"])
+            for field in ("license_files", "copyright"):
+                for value in pkg[field]:
+                    if value not in row[field]:
+                        row[field].append(value)
+
+        self._log(f"Found {len(rows)} npm packages")
+        return sorted(rows.values(), key=lambda r: r["name"])
 
     def _scan_python_dists(self, container):
         """Run the dist-info filesystem scan inside the container.
