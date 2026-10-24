@@ -100,6 +100,35 @@ def dep5_license_names(content):
     return names
 
 
+# Every non-empty license/notice/EULA/copyright file owned by an installed
+# Debian package, one "<package>\t<path>" line each, read from dpkg's file
+# lists in one pass instead of one dpkg-query call per package
+DPKG_LICENSE_FILES_SCRIPT = r"""
+for l in /var/lib/dpkg/info/*.list; do
+  [ -f "$l" ] || continue
+  p=$(basename "$l" .list)
+  p=${p%%:*}
+  grep -iE '/[^/]*(licen[cs]e|copying|eula|notice|copyright)[^/]*$' "$l" \
+    2>/dev/null |
+    grep -viE '\.(py|pyc|pyi|so|h|hpp|c|cc|js|html?|css|png|svg|pm|rb)$' |
+    while IFS= read -r f; do
+      [ -f "$f" ] && [ -s "$f" ] && printf '%s\t%s\n' "$p" "$f"
+    done
+done
+exit 0
+"""
+
+
+def parse_dpkg_license_files(output):
+    """Map package name -> owned license file paths from the script output."""
+    owned = {}
+    for line in output.splitlines():
+        package, sep, path = line.partition("\t")
+        if sep and path not in owned.setdefault(package, []):
+            owned[package].append(path)
+    return owned
+
+
 _TITLE_KEYWORD_RE = re.compile(r"\b(licen[cs]e|eula|agreement)\b", re.IGNORECASE)
 
 
@@ -1155,6 +1184,9 @@ class DockerImageInspector:
             packages = []
             lines = output.decode("utf-8").strip().split("\n")
             self._log(f"Found {len(lines)} dpkg packages")
+            owned_license_files = parse_dpkg_license_files(
+                self._exec_text(container, DPKG_LICENSE_FILES_SCRIPT)
+            )
 
             for line in lines:
                 if not line:
@@ -1172,7 +1204,9 @@ class DockerImageInspector:
                         license_source,
                         license_files,
                         copyright_lines,
-                    ) = self._get_dpkg_license(container, name)
+                    ) = self._get_dpkg_license(
+                        container, name, owned_license_files.get(name, [])
+                    )
 
                     packages.append(
                         {
@@ -1193,12 +1227,20 @@ class DockerImageInspector:
             self._log(f"dpkg extraction failed: {e}")
             return []
 
-    def _get_dpkg_license(self, container, package_name):
+    def _get_dpkg_license(self, container, package_name, owned_files=()):
         """Get license information for a dpkg package.
 
         Uses /usr/share/doc/<package>/copyright when present. Packages that
         install no copyright file (vendor packages such as Nsight or DPDK
         builds) fall back to license-like files the package itself owns.
+        Every owned license/notice file is listed in license_files either way
+        (e.g. a vendor LICENSE and third-party-notices.txt next to the
+        copyright file).
+
+        Args:
+            container: Docker container object
+            package_name: Debian package name
+            owned_files: Non-empty license-like files the package installs
 
         Returns:
             Tuple of (license_info, license_source, license_files,
@@ -1213,42 +1255,19 @@ class DockerImageInspector:
                 return (
                     license_info,
                     copyright_file,
-                    [copyright_file],
+                    [copyright_file] + [f for f in owned_files if f != copyright_file],
                     extract_copyright_lines(content.splitlines())[:MAX_COPYRIGHT_LINES],
                 )
         except Exception as e:
             self._log(f"  Warning: Failed to read {package_name} copyright: {e}")
 
-        license_files = self._dpkg_owned_license_files(container, package_name)
+        license_files = list(owned_files)
         if license_files:
             result = self._license_from_files(container, license_files)
             if result:
                 return result[0], result[1], license_files, []
             return "Unknown", "Not detected in package files", license_files, []
         return "Unknown", "Not found", [], []
-
-    def _dpkg_owned_license_files(self, container, package_name):
-        """Non-empty license/EULA/notice files installed by a dpkg package."""
-        try:
-            exit_code, output = container.exec_run(
-                [
-                    "sh",
-                    "-c",
-                    'dpkg-query -L "$1" 2>/dev/null'
-                    " | grep -iE '/[^/]*(licen[cs]e|copying|eula|notice)[^/]*$'"
-                    ' | while IFS= read -r f; do [ -f "$f" ] && [ -s "$f" ]'
-                    ' && printf "%s\\n" "$f"; done',
-                    "sh",
-                    package_name,
-                ],
-                demux=False,
-            )
-            if exit_code != 0 or not output:
-                return []
-            return output.decode("utf-8", errors="ignore").splitlines()
-        except Exception as e:
-            self._log(f"  Warning: Failed to list files of {package_name}: {e}")
-            return []
 
     def _link_python_to_dpkg(self, container, packages):
         """Set owning_dpkg on Python dists installed by Debian packages.

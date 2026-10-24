@@ -1,9 +1,13 @@
 """Tests for dpkg license handling and Debian Python ownership."""
 
+import subprocess
+
 from docker_package_inspector.inspector import (
+    DPKG_LICENSE_FILES_SCRIPT,
     DockerImageInspector,
     dep5_license_names,
     license_title,
+    parse_dpkg_license_files,
 )
 
 
@@ -126,13 +130,10 @@ def test_dpkg_license_from_copyright_file():
 def test_dpkg_without_copyright_falls_back_to_owned_files():
     eula = "/opt/nvidia/nsight-systems/EULA.txt"
     container = FakeContainer(
-        [
-            ("dpkg-query -L", (0, f"{eula}\n".encode())),
-            (f"cat {eula}", (0, b"Permission is hereby granted, free of charge")),
-        ]
+        [(f"cat {eula}", (0, b"Permission is hereby granted, free of charge"))]
     )
     license_info, source, files, _ = DockerImageInspector()._get_dpkg_license(
-        container, "nsight-systems-cli"
+        container, "nsight-systems-cli", [eula]
     )
 
     assert (license_info, source, files) == ("MIT", eula, [eula])
@@ -146,11 +147,9 @@ def test_dpkg_without_any_license_stays_unknown():
 
 def test_unrecognised_owned_file_is_listed_but_not_guessed():
     path = "/usr/share/doc/dpdk/NOTICE"
-    container = FakeContainer(
-        [("dpkg-query -L", (0, f"{path}\n".encode())), (f"cat {path}", (0, b"x"))]
-    )
+    container = FakeContainer([(f"cat {path}", (0, b"x"))])
     license_info, source, files, _ = DockerImageInspector()._get_dpkg_license(
-        container, "dpdk-community"
+        container, "dpdk-community", [path]
     )
     assert (license_info, source, files) == (
         "Unknown",
@@ -256,3 +255,45 @@ def test_owned_eula_without_known_license_is_named_by_its_title():
         "NVIDIA SOFTWARE LICENSE AGREEMENT",
         f"{eula} (title)",
     )
+
+
+def test_copyright_file_listed_first_then_other_owned_license_files():
+    copyright_file = "/usr/share/doc/libdcgm/copyright"
+    owned = [
+        "/usr/share/doc/datacenter-gpu-manager-4/LICENSE",
+        copyright_file,
+        "/usr/share/doc/datacenter-gpu-manager-4/third-party-notices.txt",
+    ]
+    container = FakeContainer([(f"cat {copyright_file}", (0, DCGM_COPYRIGHT.encode()))])
+    _, _, files, _ = DockerImageInspector()._get_dpkg_license(
+        container, "libdcgm", owned
+    )
+    assert files == [copyright_file, owned[0], owned[2]]
+
+
+def test_dpkg_license_files_script_on_fake_root(tmp_path):
+    info = tmp_path / "var" / "lib" / "dpkg" / "info"
+    info.mkdir(parents=True)
+    doc = tmp_path / "usr" / "share" / "doc" / "libdcgm"
+    doc.mkdir(parents=True)
+    for name, text in {
+        "copyright": "NVIDIA LICENSE",
+        "third-party-notices.txt": "notices",
+        "LICENSE.empty": "",
+        "license.py": "x = 1",
+        "README": "readme",
+    }.items():
+        (doc / name).write_text(text)
+    (info / "libdcgm:amd64.list").write_text(
+        "\n".join(str(doc / n) for n in sorted(p.name for p in doc.iterdir()))
+        + f"\n{doc}\n{tmp_path}/usr/share/doc/libdcgm/MISSING-LICENSE\n"
+    )
+
+    script = DPKG_LICENSE_FILES_SCRIPT.replace("/var/lib/dpkg/info", str(info))
+    output = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, check=True
+    ).stdout
+
+    assert parse_dpkg_license_files(output) == {
+        "libdcgm": [str(doc / "copyright"), str(doc / "third-party-notices.txt")]
+    }
