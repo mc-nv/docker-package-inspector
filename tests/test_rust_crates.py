@@ -11,15 +11,19 @@ import zlib
 import pytest
 
 from docker_package_inspector.rust_crates import (
+    CARGO_FILES_SCRIPT,
     RECORD_LOOKUP_SCRIPT,
     git_repository,
     is_crates_io,
+    local_roots,
+    lock_crates,
     maturin_module_name,
     module_stem,
     parse_auditable,
     parse_cargo_lock,
     parse_cargo_toml,
     parse_crate_archive,
+    parse_crates2_json,
     parse_hosts,
     resolve_project_crates,
     resolve_record_owners,
@@ -390,3 +394,111 @@ def test_unresolved_binary_row_uses_owner_name():
         "/usr/local/bin/tool", None, "/usr/local/bin/tool", False
     )
     assert orphan["parent_packages"] == []
+
+
+def test_lock_crates_per_workspace_root_without_dev_deps():
+    files = {"/src/proj/crates/demo/Cargo.toml": TOML}
+    tomls = {p: parse_cargo_toml(t) for p, t in files.items()}
+    found = lock_crates(LOCK, tomls, "/src/proj")
+    assert sorted((c["name"], c["version"], roots) for c, roots in found) == [
+        ("libc", "0.2.150", ["demo"]),
+        ("pyo3", "0.22.0", ["demo"]),
+        ("serde", "1.0.200", ["demo"]),
+    ]
+
+
+def test_lock_crates_without_cargo_toml_reports_every_registry_package():
+    found = lock_crates(LOCK, {}, "/src/proj")
+    assert sorted((c["name"], c["version"]) for c, _ in found) == [
+        ("criterion", "0.5.1"),
+        ("libc", "0.2.150"),
+        ("pyo3", "0.22.0"),
+        ("serde", "1.0.150"),
+        ("serde", "1.0.200"),
+    ]
+    # A Cargo.toml outside the lock's directory is not one of its roots
+    assert (
+        local_roots(
+            parse_cargo_lock(LOCK),
+            {"/other/Cargo.toml": parse_cargo_toml(TOML)},
+            "/src/proj",
+        )
+        == []
+    )
+
+
+def test_parse_crates2_json():
+    text = json.dumps(
+        {
+            "installs": {
+                "ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)": {},
+                "tool 0.1.0 (path+file:///src/tool)": {},
+            }
+        }
+    )
+    assert parse_crates2_json(text) == [
+        {
+            "name": "ripgrep",
+            "version": "14.1.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+        },
+        {"name": "tool", "version": "0.1.0", "source": "path+file:///src/tool"},
+    ]
+    assert parse_crates2_json("not json") == []
+
+
+def test_unmatched_lock_and_cargo_install_are_inventoried():
+    insp = _inspector_with_fake_crates_io()
+    lock = "/opt/vllm/vllm-src/rust/Cargo.lock"
+    crates2 = "/root/.cargo/.crates2.json"
+    cargo_files = {
+        lock: LOCK,
+        "/opt/vllm/vllm-src/rust/Cargo.toml": TOML,
+        crates2: json.dumps(
+            {"installs": {"ripgrep 14.1.0 (registry+https://x/crates.io-index)": {}}}
+        ),
+    }
+    crates = {}
+    insp._inventory_cargo_files(crates, cargo_files, used_locks=set())
+
+    assert set(crates) == {"libc", "pyo3", "serde", "ripgrep"}
+    assert crates["pyo3"]["install_path"] == [lock]
+    assert crates["pyo3"]["parent_packages"] == ["demo"]
+    assert crates["pyo3"]["package_provider"] == "Cargo.lock(image)"
+    assert crates["ripgrep"]["is_dependency"] is False
+    assert crates["ripgrep"]["package_provider"] == "cargo-install"
+
+    # A lock already used to resolve a binary is not inventoried again
+    crates = {}
+    insp._inventory_cargo_files(crates, {lock: LOCK}, used_locks={lock})
+    assert crates == {}
+
+
+def test_cargo_files_script_on_fake_root(tmp_path):
+    proj = tmp_path / "opt" / "proj"
+    (proj / "crates" / "demo").mkdir(parents=True)
+    (proj / "Cargo.lock").write_text(LOCK)
+    (proj / "crates" / "demo" / "Cargo.toml").write_text(TOML)
+    cargo = tmp_path / "root" / ".cargo"
+    (cargo / "registry" / "src" / "x" / "dep-1.0").mkdir(parents=True)
+    (cargo / "registry" / "src" / "x" / "dep-1.0" / "Cargo.lock").write_text(LOCK)
+    (cargo / ".crates2.json").write_text('{"installs": {}}')
+
+    script = CARGO_FILES_SCRIPT.replace("find / -xdev", f"find {tmp_path} -xdev")
+    output = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True, check=True
+    ).stdout
+    files = split_files(output)
+
+    assert sorted(files) == [
+        str(proj / "Cargo.lock"),
+        str(proj / "crates" / "demo" / "Cargo.toml"),
+        str(cargo / ".crates2.json"),
+    ]
+    assert files[str(proj / "Cargo.lock")].strip() == LOCK.strip()
+    assert (
+        parse_cargo_toml(files[str(proj / "crates" / "demo" / "Cargo.toml")])[
+            "lib_name"
+        ]
+        == "_demo"
+    )

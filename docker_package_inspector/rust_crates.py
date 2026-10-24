@@ -61,23 +61,25 @@ exit 0
 """
 
 # Prints every Cargo.lock (outside cargo's own download cache) with the
-# Cargo.toml files of its project tree:
+# Cargo.toml files of its project tree, and every cargo install record
+# (.crates2.json):
 #   @@FILE <path>
 #   <content>
 CARGO_FILES_SCRIPT = r"""
 find / -xdev \( -path /proc -o -path /sys -o -path /dev \
   -o -path '*/.cargo/registry' -o -path '*/.cargo/git' \) -prune -o \
-  -type f -name Cargo.lock -print 2>/dev/null |
-while IFS= read -r lock; do
-  dir=$(dirname "$lock")
-  printf '@@FILE %s\n' "$lock"
-  head -c 2097152 "$lock"
-  find "$dir" -maxdepth 3 -name Cargo.toml -type f 2>/dev/null |
-  while IFS= read -r toml; do
-    printf '\n@@FILE %s\n' "$toml"
-    head -c 262144 "$toml"
-  done
+  -type f \( -name Cargo.lock -o -name .crates2.json \) -print 2>/dev/null |
+while IFS= read -r f; do
+  printf '@@FILE %s\n' "$f"
+  head -c 2097152 "$f"
   printf '\n'
+  [ "$(basename "$f")" = Cargo.lock ] || continue
+  find "$(dirname "$f")" -maxdepth 3 -name Cargo.toml -type f 2>/dev/null |
+  while IFS= read -r toml; do
+    printf '@@FILE %s\n' "$toml"
+    head -c 262144 "$toml"
+    printf '\n'
+  done
 done
 """
 
@@ -324,6 +326,78 @@ def parse_cargo_toml(text):
         "normal_deps": normal,
         "non_runtime_deps": non_runtime,
     }
+
+
+def local_roots(lock_packages, tomls, lock_dir):
+    """Workspace crates of a Cargo.lock, paired with their Cargo.toml.
+
+    Args:
+        lock_packages: Parsed Cargo.lock packages
+        tomls: Dict of Cargo.toml path -> parsed Cargo.toml
+        lock_dir: Directory containing the Cargo.lock
+
+    Returns:
+        List of (crate name, parsed Cargo.toml) for the lock's local
+        (sourceless) packages that have a Cargo.toml under lock_dir
+    """
+    local = {p["name"] for p in lock_packages if not p["source"]}
+    roots = []
+    for path, toml in sorted(tomls.items()):
+        if path.startswith(lock_dir + "/") and toml["name"] in local:
+            if toml["name"] not in [name for name, _ in roots]:
+                roots.append((toml["name"], toml))
+    return roots
+
+
+def lock_crates(lock_text, tomls, lock_dir):
+    """Runtime crates of every workspace crate of a Cargo.lock.
+
+    When no workspace Cargo.toml is available, every registry/git package in
+    the lock is returned (over-reports, never hides).
+
+    Returns:
+        List of (crate, root names) pairs, one per distinct crate version
+    """
+    packages = parse_cargo_lock(lock_text)
+    roots = local_roots(packages, tomls, lock_dir)
+    found = {}
+    if not roots:
+        for pkg in packages:
+            if pkg["source"]:
+                found[(pkg["name"], pkg["version"])] = (pkg, [])
+        return list(found.values())
+    for root_name, root_toml in roots:
+        for pkg in runtime_closure(packages, root_name, root_toml):
+            entry = found.setdefault((pkg["name"], pkg["version"]), (pkg, []))
+            if root_name not in entry[1]:
+                entry[1].append(root_name)
+    return list(found.values())
+
+
+def parse_crates2_json(text):
+    """Crates installed with ``cargo install``, from a .crates2.json file.
+
+    Keys look like ``"ripgrep 14.1.0 (registry+https://...crates.io-index)"``.
+
+    Returns:
+        List of {"name", "version", "source"} dicts
+    """
+    try:
+        installs = json.loads(text).get("installs", {})
+    except (ValueError, AttributeError):
+        return []
+    crates = []
+    for key in installs:
+        match = re.match(r"^(\S+) (\S+) \((.*)\)$", key)
+        if match:
+            crates.append(
+                {
+                    "name": match.group(1),
+                    "version": match.group(2),
+                    "source": match.group(3),
+                }
+            )
+    return crates
 
 
 def maturin_module_name(pyproject_text):

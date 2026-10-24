@@ -2,6 +2,7 @@
 
 import io
 import json
+import posixpath
 import re
 import signal
 import subprocess
@@ -46,9 +47,12 @@ from .rust_crates import (
     RUST_HOSTS_SCRIPT,
     git_repository,
     is_crates_io,
+    lock_crates,
     maturin_module_name,
     module_stem,
     parse_auditable,
+    parse_cargo_toml,
+    parse_crates2_json,
     parse_hosts,
     resolve_project_crates,
     resolve_record_owners,
@@ -535,6 +539,13 @@ class DockerImageInspector:
             python_packages: Python package rows, used to find which wheel
                 installed each Rust binary
 
+        Every Cargo.lock in the image is also inventoried: one used to
+        resolve a binary adds its path to those crates, any other one has
+        the runtime crates of its workspace reported on their own, so a
+        shipped Rust project is never missed for lack of a matching binary.
+        Crates installed with ``cargo install`` (.crates2.json) are reported
+        too.
+
         Returns:
             List of package dictionaries: one "rust" row per crate, and one
             "rust-binary" row per Rust binary whose crates could not be
@@ -542,8 +553,6 @@ class DockerImageInspector:
         """
         self._log("Scanning for Rust binaries...")
         hosts = parse_hosts(self._exec_text(container, RUST_HOSTS_SCRIPT))
-        if not hosts:
-            return []
         self._log(f"Found {len(hosts)} Rust binaries")
 
         host_owner = self._record_owners(
@@ -557,6 +566,7 @@ class DockerImageInspector:
         crates = {}
         unresolved = []
         sdist_cache = {}
+        used_locks = set()
         for path, auditable in hosts:
             owner = host_owner.get(path)
             # The package that ships the binary, like parent_packages of every
@@ -568,9 +578,12 @@ class DockerImageInspector:
             if auditable:
                 found = self._auditable_crates(container, path)
                 provider = "cargo-auditable"
+            image_lock = None
             if found is None and cargo_files:
-                found, lock = resolve_project_crates(cargo_files, module_stem(path))
-                provider = f"Cargo.lock(image): {lock}"
+                found, image_lock = resolve_project_crates(
+                    cargo_files, module_stem(path)
+                )
+                provider = f"Cargo.lock(image): {image_lock}"
             if found is None and owner is not None:
                 key = (owner["name"], owner["version"])
                 if key not in sdist_cache:
@@ -600,12 +613,57 @@ class DockerImageInspector:
                 self._add_crate(
                     crates, crate, path, parent, provider.split(":")[0], private
                 )
+                locations = crates[crate["name"]]["install_path"]
+                if image_lock and image_lock not in locations:
+                    locations.append(image_lock)
+            if image_lock:
+                used_locks.add(image_lock)
+
+        self._inventory_cargo_files(crates, cargo_files, used_locks)
 
         self._log(
             f"Resolved {len(crates)} crates; {len(unresolved)} Rust binaries "
             "unresolved"
         )
         return sorted(crates.values(), key=lambda c: c["name"]) + unresolved
+
+    def _inventory_cargo_files(self, crates, cargo_files, used_locks):
+        """Report crates of Cargo.lock files no binary was resolved from, and
+        of cargo install records.
+
+        Args:
+            crates: Dict of crate name -> row, updated in place
+            cargo_files: Dict of path -> text from CARGO_FILES_SCRIPT
+            used_locks: Cargo.lock paths already used to resolve a binary
+        """
+        tomls = {
+            path: parse_cargo_toml(text)
+            for path, text in cargo_files.items()
+            if posixpath.basename(path) == "Cargo.toml"
+        }
+        for path, text in sorted(cargo_files.items()):
+            name = posixpath.basename(path)
+            private = is_private_env(path)
+            if name == ".crates2.json":
+                installed = parse_crates2_json(text)
+                self._log(f"  {path}: {len(installed)} crates from cargo install")
+                for crate in installed:
+                    self._add_crate(
+                        crates, crate, path, path, "cargo-install", private, False
+                    )
+                continue
+            if name != "Cargo.lock":
+                continue
+            if path in used_locks:
+                self._log(f"  {path}: matched to a Rust binary")
+                continue
+            found = lock_crates(text, tomls, posixpath.dirname(path))
+            self._log(f"  {path}: {len(found)} crates (not matched to a binary)")
+            for crate, roots in found:
+                for parent in roots or [path]:
+                    self._add_crate(
+                        crates, crate, path, parent, "Cargo.lock(image)", private
+                    )
 
     def _record_owners(self, container, paths, python_packages):
         """Map file paths to the Python package whose RECORD lists them.
@@ -724,7 +782,9 @@ class DockerImageInspector:
             self._log(f"  Warning: Failed to read sdist {url}: {e}")
             return {}
 
-    def _add_crate(self, crates, crate, location, parent, provider, private):
+    def _add_crate(
+        self, crates, crate, location, parent, provider, private, dependency=True
+    ):
         """Merge one crate occurrence into the per-name crate rows.
 
         Args:
@@ -735,6 +795,8 @@ class DockerImageInspector:
             provider: How the crate list was obtained
             private: Whether location is in a non-main environment; the row is
                 private only if every location is
+            dependency: False for a crate installed in its own right (cargo
+                install); the row is a dependency if any occurrence is one
         """
         name, version, source = crate["name"], crate["version"], crate["source"]
         if is_crates_io(source):
@@ -762,7 +824,7 @@ class DockerImageInspector:
                 "source_code_url": meta["repository"],
                 "package_provider": provider,
                 "package_type": "rust",
-                "is_dependency": True,
+                "is_dependency": dependency,
                 "parent_packages": [],
                 "install_path": [],
                 "copyright": [],
@@ -779,6 +841,7 @@ class DockerImageInspector:
             if provider not in providers:
                 row["package_provider"] = ", ".join(sorted(providers + [provider]))
         row["is_private_env"] = row["is_private_env"] and private
+        row["is_dependency"] = row["is_dependency"] or dependency
         if parent not in row["parent_packages"]:
             row["parent_packages"].append(parent)
         if location not in row["install_path"]:

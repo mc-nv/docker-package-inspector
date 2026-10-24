@@ -158,6 +158,14 @@ excluding its own dev/build dependencies. Transitive build-time crates
 (proc-macros) cannot be told apart from a `Cargo.lock` alone and are kept, so
 the list may over-report but not under-report. Binaries whose crates cannot be
 resolved are reported as `rust-binary` rows with an `Unknown` license.
+
+Every `Cargo.lock` in the image (outside cargo's download cache) is checked as
+well. A lock that was not used for any binary has the runtime crates of its
+workspace crates reported on their own (`Cargo.lock(image)` provider, the lock
+in `install_path`, the workspace crate names in `parent_packages`); without a
+workspace `Cargo.toml` next to it, every registry package in the lock is
+reported. Crates installed with `cargo install` (`.crates2.json`) are reported
+with the `cargo-install` provider.
 License, repository and copyright holders come from the published `.crate`,
 verified against the `Cargo.lock` checksum.
 
