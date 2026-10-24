@@ -27,6 +27,7 @@ from .python_dists import (
     dist_info_version,
     extract_copyright_lines,
     group_dists,
+    is_private_env,
     local_license,
     local_license_fallback,
     normalize_name,
@@ -548,6 +549,9 @@ class DockerImageInspector:
         host_owner = self._record_owners(
             container, [path for path, _ in hosts], python_packages
         )
+        host_dpkg = self._dpkg_owners(
+            container, [path for path, _ in hosts if path not in host_owner]
+        )
         cargo_files = split_files(self._exec_text(container, CARGO_FILES_SCRIPT))
 
         crates = {}
@@ -555,6 +559,10 @@ class DockerImageInspector:
         sdist_cache = {}
         for path, auditable in hosts:
             owner = host_owner.get(path)
+            # The package that ships the binary, like parent_packages of every
+            # other row type; the binary itself goes to install_path
+            parent = owner["name"] if owner else host_dpkg.get(path, path)
+            private = is_private_env(path)
             found, provider = None, None
 
             if auditable:
@@ -583,11 +591,15 @@ class DockerImageInspector:
                     provider = f"Cargo.lock(sdist): {owner['name']}=={owner['version']}"
 
             if found is None:
-                unresolved.append(self._unresolved_rust_binary(path, owner))
+                unresolved.append(
+                    self._unresolved_rust_binary(path, owner, parent, private)
+                )
                 continue
             self._log(f"  {path}: {len(found)} crates via {provider}")
             for crate in found:
-                self._add_crate(crates, crate, path, provider.split(":")[0])
+                self._add_crate(
+                    crates, crate, path, parent, provider.split(":")[0], private
+                )
 
         self._log(
             f"Resolved {len(crates)} crates; {len(unresolved)} Rust binaries "
@@ -712,8 +724,18 @@ class DockerImageInspector:
             self._log(f"  Warning: Failed to read sdist {url}: {e}")
             return {}
 
-    def _add_crate(self, crates, crate, host_path, provider):
-        """Merge one crate occurrence into the per-name crate rows."""
+    def _add_crate(self, crates, crate, location, parent, provider, private):
+        """Merge one crate occurrence into the per-name crate rows.
+
+        Args:
+            crates: Dict of crate name -> row, updated in place
+            crate: {"name", "version", "source", "checksum"?} of the crate
+            location: Binary embedding the crate, or the Cargo.lock listing it
+            parent: Package that ships the binary or lock (or its path)
+            provider: How the crate list was obtained
+            private: Whether location is in a non-main environment; the row is
+                private only if every location is
+        """
         name, version, source = crate["name"], crate["version"], crate["source"]
         if is_crates_io(source):
             meta = self.metadata_fetcher.get_crate_metadata(
@@ -742,7 +764,9 @@ class DockerImageInspector:
                 "package_type": "rust",
                 "is_dependency": True,
                 "parent_packages": [],
+                "install_path": [],
                 "copyright": [],
+                "is_private_env": private,
             }
         else:
             versions = row["version"].split(", ")
@@ -754,14 +778,17 @@ class DockerImageInspector:
             providers = row["package_provider"].split(", ")
             if provider not in providers:
                 row["package_provider"] = ", ".join(sorted(providers + [provider]))
-        if host_path not in row["parent_packages"]:
-            row["parent_packages"].append(host_path)
+        row["is_private_env"] = row["is_private_env"] and private
+        if parent not in row["parent_packages"]:
+            row["parent_packages"].append(parent)
+        if location not in row["install_path"]:
+            row["install_path"].append(location)
         for line in meta["copyright"]:
             if line not in row["copyright"]:
                 row["copyright"].append(line)
 
     @staticmethod
-    def _unresolved_rust_binary(path, owner):
+    def _unresolved_rust_binary(path, owner, parent, private):
         """Row for a Rust binary whose crates could not be determined."""
         return {
             "name": path.rsplit("/", 1)[-1],
@@ -773,8 +800,9 @@ class DockerImageInspector:
             "package_provider": "unresolved",
             "package_type": "rust-binary",
             "is_dependency": False,
-            "parent_packages": [owner["name"]] if owner else [],
+            "parent_packages": [parent] if parent != path else [],
             "install_path": [path],
+            "is_private_env": private,
         }
 
     def _dpkg_owners(self, container, paths):

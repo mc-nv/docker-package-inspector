@@ -344,3 +344,49 @@ def test_small_helpers():
     assert git_repository("git+https://github.com/a/b?rev=1#abc") == (
         "https://github.com/a/b"
     )
+
+
+def _inspector_with_fake_crates_io():
+    from docker_package_inspector.inspector import DockerImageInspector
+
+    insp = DockerImageInspector()
+    insp.metadata_fetcher.get_crate_metadata = lambda name, version, checksum="": {
+        "license": "MIT",
+        "license_source": "crate Cargo.toml",
+        "repository": "",
+        "copyright": [],
+    }
+    return insp
+
+
+def test_crate_rows_name_owning_package_and_keep_paths_in_install_path():
+    insp = _inspector_with_fake_crates_io()
+    crates = {}
+    serde = {"name": "serde", "version": "1.0.200", "source": "crates.io"}
+    dali_so = "/opt/tritonserver/backends/dali/wheel/dali/libcst/native.so"
+    core_so = "/usr/local/lib/python3.12/dist-packages/pydantic_core/_pc.so"
+
+    insp._add_crate(crates, serde, dali_so, "dali", "Cargo.lock(sdist)", True)
+    assert crates["serde"]["is_private_env"] is True
+
+    insp._add_crate(crates, serde, core_so, "pydantic-core", "Cargo.lock(sdist)", False)
+    row = crates["serde"]
+    assert row["parent_packages"] == ["dali", "pydantic-core"]
+    assert row["install_path"] == [dali_so, core_so]
+    assert row["is_private_env"] is False
+
+
+def test_unresolved_binary_row_uses_owner_name():
+    from docker_package_inspector.inspector import DockerImageInspector
+
+    row = DockerImageInspector._unresolved_rust_binary(
+        "/x/_tiktoken.so", {"name": "tiktoken", "version": "0.14.0"}, "tiktoken", False
+    )
+    assert (row["parent_packages"], row["install_path"]) == (
+        ["tiktoken"],
+        ["/x/_tiktoken.so"],
+    )
+    orphan = DockerImageInspector._unresolved_rust_binary(
+        "/usr/local/bin/tool", None, "/usr/local/bin/tool", False
+    )
+    assert orphan["parent_packages"] == []

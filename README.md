@@ -571,8 +571,8 @@ When inspecting multiple images or architectures, the structure changes to:
 - `package_type`: `python`, `binary`, `rust`, `rust-binary`, `java` or `npm`
 - `package_provider`: What installed it: `PIP`, `uv`, `dpkg`, `RPM`, `APK`, `maven`, `jar`, `npm`, `unowned`, or how a crate was resolved (`cargo-auditable`, `Cargo.lock(image)`, `Cargo.lock(sdist)`)
 - `is_dependency`: Boolean indicating if this package is a dependency of another package
-- `parent_packages`: Packages that depend on this package; for crates, the binaries that embed them; for Java artifacts, the jars that contain them
-- `install_path`: Where the package is installed (dist-info directories, module directories, runtime paths)
+- `parent_packages`: Packages that depend on this package; for crates, the packages (wheel or Debian package) that ship the binaries embedding them, or the binary path when no package owns it; for Java artifacts, the jars that contain them
+- `install_path`: Where the package is installed (dist-info directories, module directories, runtime paths); for crates, the binaries that embed them and the `Cargo.lock` files that list them
 - `license_files`: License/copyright/notice files present in the image, each verified to exist and be non-empty (`<jar>!/<entry>` for files inside a jar)
 - `copyright`: Copyright holder lines from those files (and crate/npm authors)
 - `is_private_env`: `true` when every copy lives in a non-main environment (vendored `_vendor` copies, installer caches, tool-private interpreters such as Nsight Systems, backend-private wheel directories, `~/.m2`); such packages are flagged, never dropped
